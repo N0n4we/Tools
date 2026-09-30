@@ -23,7 +23,9 @@ runs:
 
         stage="$(mktemp -d)"
         trap 'rm -rf -- "$stage"' EXIT
-        tar -czf "$stage/pi-hermes-memory.tar.gz" -C "$HOME/.pi/agent" pi-hermes-memory
+        # The session search index is ephemeral; omit it and SQLite sidecars.
+        tar --exclude='sessions.db*' -czf "$stage/pi-hermes-memory.tar.gz" \
+          -C "$HOME/.pi/agent" pi-hermes-memory
         printf '%s\n' "$PI_MEMORY_PASSPHRASE" |
           gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 \
             --symmetric --cipher-algo AES256 --s2k-digest-algo SHA512 \
@@ -69,6 +71,7 @@ runs:
         jj config set --repo user.name '"github-actions[bot]"'
         jj config set --repo user.email '"41898282+github-actions[bot]@users.noreply.github.com"'
         jj metaedit --update-author
+        jj bookmark track main@origin
         jj describe -m 'Update Pi Hermes memory backup'
         jj bookmark set main -r @
         jj git push --remote origin --bookmark main
