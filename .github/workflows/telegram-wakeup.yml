@@ -1,0 +1,331 @@
+name: Telegram wake-up
+
+on:
+  workflow_dispatch:
+
+# Pi's wake-up process and the assistant share one Telegram bot token.
+concurrency:
+  group: telegram-assistant-main
+  cancel-in-progress: false
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  wake-up:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/n0n4we/tools/pi-agent:latest
+      options: --user 0:0
+    permissions:
+      actions: read
+      contents: write
+    timeout-minutes: 360
+    steps:
+      - name: Validate required repository secrets
+        id: secrets
+        shell: bash
+        env:
+          TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          PI_MEMORY_PASSPHRASE: ${{ secrets.PI_MEMORY_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          : "${TELEGRAM_USER_ID:?Missing repository secret TELEGRAM_USER_ID}"
+          : "${TELEGRAM_BOT_TOKEN:?Missing repository secret TELEGRAM_BOT_TOKEN}"
+          : "${OPENROUTER_API_KEY:?Missing repository secret OPENROUTER_API_KEY}"
+          : "${PI_MEMORY_PASSPHRASE:?Missing repository secret PI_MEMORY_PASSPHRASE}"
+          [[ "$TELEGRAM_USER_ID" =~ ^[1-9][0-9]*$ ]] || {
+            echo 'TELEGRAM_USER_ID must be a positive numeric Telegram user ID.' >&2
+            exit 1
+          }
+
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Expose bundled Pi extensions to the Actions home
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundled_agent=/root/.pi/agent
+          actions_agent="$HOME/.pi/agent"
+          [[ -d "$bundled_agent" ]] || { echo 'Bundled Pi agent directory is missing.' >&2; exit 1; }
+          mkdir -p "$HOME/.pi"
+          if [[ -e "$actions_agent" || -L "$actions_agent" ]]; then
+            [[ -L "$actions_agent" && "$(readlink "$actions_agent")" == "$bundled_agent" ]] || {
+              echo 'Actions home already contains an unexpected Pi agent directory.' >&2
+              exit 1
+            }
+          else
+            ln -s "$bundled_agent" "$actions_agent"
+          fi
+
+      - name: Verify the bundled Pi runtime and extensions
+        shell: bash
+        run: |
+          set -euo pipefail
+          pi --version
+          packages="$(pi list)"
+          printf '%s\n' "$packages"
+          grep -Fq 'npm:@llblab/pi-telegram@0.51.6' <<< "$packages" || {
+            echo 'The bundled pi-telegram extension is not visible to Pi.' >&2
+            exit 1
+          }
+          grep -Fq 'npm:pi-hermes-memory' <<< "$packages" || {
+            echo 'The bundled pi-hermes-memory extension is not visible to Pi.' >&2
+            exit 1
+          }
+
+      # Store only the encrypted Telegram inbox archive in Actions cache.
+      - name: Restore encrypted Telegram inbox state
+        id: inbox-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/pi-telegram-inbox.tar.gz.gpg
+          key: pi-telegram-inbox-main-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            pi-telegram-inbox-main-
+
+      - name: Decrypt and restore Telegram inbox state
+        if: steps.inbox-cache.outputs.cache-matched-key != ''
+        shell: bash
+        env:
+          PI_MEMORY_PASSPHRASE: ${{ secrets.PI_MEMORY_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/pi-telegram-inbox.tar.gz.gpg"
+          stage="$(mktemp -d)"
+          trap 'rm -rf -- "$stage"' EXIT
+          printf '%s\n' "$PI_MEMORY_PASSPHRASE" |
+            gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 \
+              --output "$stage/inbox.tar.gz" --decrypt "$archive"
+
+          while IFS= read -r entry; do
+            entry="${entry#./}"
+            case "$entry" in
+              tmp/telegram/inbox.json|tmp/telegram/inbox.json.segments|tmp/telegram/inbox.json.segments/|tmp/telegram/inbox.json.segments/*) ;;
+              *) echo 'Encrypted Telegram state archive has an unexpected path.' >&2; exit 1 ;;
+            esac
+          done < <(tar -tzf "$stage/inbox.tar.gz")
+
+          mkdir -p "$HOME/.pi/agent"
+          tar -xzf "$stage/inbox.tar.gz" -C "$HOME/.pi/agent" --no-same-owner --no-same-permissions
+          if [[ -L "$HOME/.pi/agent/tmp/telegram/inbox.json" || -L "$HOME/.pi/agent/tmp/telegram/inbox.json.segments" ]] || \
+            find "$HOME/.pi/agent/tmp/telegram/inbox.json.segments" -type l -print -quit 2>/dev/null | grep -q .; then
+            echo 'Telegram inbox state must not contain symbolic links.' >&2
+            exit 1
+          fi
+
+      - name: Restore Pi Hermes memory
+        uses: ./.github/actions/load-pi-memory
+        with:
+          passphrase: ${{ secrets.PI_MEMORY_PASSPHRASE }}
+          archive: .github/pi-memory/pi-hermes-memory.tar.gz.gpg
+
+      - name: Configure the Telegram owner
+        shell: bash
+        env:
+          TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const id = process.env.TELEGRAM_USER_ID;
+          if (!/^[1-9][0-9]*$/.test(id ?? '') || !Number.isSafeInteger(Number(id))) {
+            throw new Error('TELEGRAM_USER_ID must be a positive safe integer.');
+          }
+          const file = path.join(process.env.HOME, '.pi', 'agent', 'telegram.json');
+          fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+          const config = {
+            profiles: {
+              default: {
+                botToken: '$TELEGRAM_BOT_TOKEN',
+                allowedUserId: Number(id),
+              },
+            },
+          };
+          fs.writeFileSync(file, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
+          NODE
+
+      # pi-telegram uses the v1 journal schema. Seed an explicit cursor so its
+      # first connection does not discard pending updates during history sync.
+      - name: Initialize the first Telegram inbox cursor
+        id: initialize-cursor
+        shell: bash
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const crypto = require('node:crypto');
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const directory = path.join(process.env.HOME, '.pi', 'agent', 'tmp', 'telegram');
+          const journal = path.join(directory, 'inbox.json');
+          const segments = `${journal}.segments`;
+          const tokenSha256 = crypto.createHash('sha256').update(process.env.TELEGRAM_BOT_TOKEN).digest('hex');
+          fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+          const lstatIfPresent = (file) => {
+            try { return fs.lstatSync(file); }
+            catch (error) { if (error.code === 'ENOENT') return undefined; throw error; }
+          };
+          const journalStat = lstatIfPresent(journal);
+          if (journalStat) {
+            if (!journalStat.isFile() || journalStat.isSymbolicLink()) {
+              throw new Error('Telegram inbox journal has an unexpected file type.');
+            }
+            let existing;
+            try { existing = JSON.parse(fs.readFileSync(journal, 'utf8')); }
+            catch { throw new Error('Telegram inbox journal is not valid JSON; refusing to replace it.'); }
+            if (existing?.version === 1 && existing.profile === 'default' &&
+                existing.botIdentity?.tokenSha256 === tokenSha256 &&
+                Number.isSafeInteger(existing.acceptedThroughUpdateId) && existing.acceptedThroughUpdateId >= 0 &&
+                Array.isArray(existing.entries)) {
+              process.exit(0);
+            }
+            const seedKeys = ['acceptedThroughUpdateId', 'botIdentity', 'entries', 'profile', 'revision', 'version'];
+            const identityKeys = ['tokenSha256'];
+            const isPriorEmptySeed = existing?.version === 3 && existing.revision === 1 &&
+              existing.acceptedThroughUpdateId === 0 && existing.profile === 'default' &&
+              Array.isArray(existing.entries) && existing.entries.length === 0 &&
+              existing.botIdentity?.tokenSha256 === tokenSha256 &&
+              Object.keys(existing).sort().join(',') === seedKeys.join(',') &&
+              Object.keys(existing.botIdentity ?? {}).sort().join(',') === identityKeys.join(',');
+            if (isPriorEmptySeed && !lstatIfPresent(segments) && !fs.lstatSync(directory).isSymbolicLink()) {
+              const corrected = { ...existing, version: 1 };
+              const temporary = `${journal}.${process.pid}.tmp`;
+              fs.writeFileSync(temporary, `${JSON.stringify(corrected)}\n`, { mode: 0o600, flag: 'wx' });
+              fs.renameSync(temporary, journal);
+              console.log('Migrated the empty initial Telegram cursor to pi-telegram v1 schema.');
+              process.exit(0);
+            }
+            throw new Error('Telegram inbox journal schema or identity is unexpected; refusing to replace it.');
+          }
+          if (lstatIfPresent(segments) || fs.lstatSync(directory).isSymbolicLink()) {
+            throw new Error('Telegram inbox journal is incomplete; refusing to replace its state.');
+          }
+          const snapshot = {
+            version: 1,
+            revision: 1,
+            acceptedThroughUpdateId: 0,
+            profile: 'default',
+            botIdentity: { tokenSha256 },
+            entries: [],
+          };
+          const temporary = `${journal}.${process.pid}.tmp`;
+          fs.writeFileSync(temporary, `${JSON.stringify(snapshot)}\n`, { mode: 0o600, flag: 'wx' });
+          fs.renameSync(temporary, journal);
+          NODE
+
+      - name: Snapshot memory before handling messages
+        id: memory-before
+        shell: bash
+        run: |
+          set -euo pipefail
+          directory="$HOME/.pi/agent/pi-hermes-memory"
+          if [[ -d "$directory" ]]; then
+            digest="$(tar --exclude='sessions.db*' --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
+              -cf - -C "$directory" . | sha256sum | cut -d' ' -f1)"
+          else
+            digest=missing
+          fi
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          has_sessions_db=false
+          for file in "$directory"/sessions.db*; do
+            if [[ -e "$file" || -L "$file" ]]; then
+              has_sessions_db=true
+              break
+            fi
+          done
+          echo "has_sessions_db=$has_sessions_db" >> "$GITHUB_OUTPUT"
+
+      - name: Start Pi and run the wake-up conversation
+        shell: bash
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          PI_TELEGRAM_MODEL: openrouter/stealth/space-bunny-alpha
+          PI_WAKEUP_COMPLETED_FILE: ${{ runner.temp }}/pi-telegram-wakeup-confirmed
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/pi-telegram-wakeup-workspace"
+          node "$GITHUB_WORKSPACE/.github/scripts/telegram-wakeup.mjs"
+
+      - name: Snapshot memory after handling messages
+        id: memory-after
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          directory="$HOME/.pi/agent/pi-hermes-memory"
+          if [[ -d "$directory" ]]; then
+            digest="$(tar --exclude='sessions.db*' --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
+              -cf - -C "$directory" . | sha256sum | cut -d' ' -f1)"
+          else
+            digest=missing
+          fi
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Encrypt Telegram inbox state for the next run
+        id: save-inbox-state
+        if: always() && steps.secrets.outcome == 'success' && steps.initialize-cursor.outcome == 'success'
+        shell: bash
+        env:
+          PI_MEMORY_PASSPHRASE: ${{ secrets.PI_MEMORY_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          agent="$HOME/.pi/agent"
+          state="$agent/tmp/telegram"
+          stage="$(mktemp -d)"
+          trap 'rm -rf -- "$stage"' EXIT
+          mkdir -p "$state"
+
+          files=()
+          journal="$state/inbox.json"
+          segments="$journal.segments"
+          if [[ -e "$journal" || -L "$journal" ]]; then
+            [[ -f "$journal" && ! -L "$journal" ]] || { echo 'Telegram inbox journal has an unexpected file type.' >&2; exit 1; }
+            files+=(tmp/telegram/inbox.json)
+          fi
+          if [[ -e "$segments" || -L "$segments" ]]; then
+            [[ -d "$segments" && ! -L "$segments" ]] || { echo 'Telegram inbox segments have an unexpected file type.' >&2; exit 1; }
+            if find "$segments" -type l -print -quit | grep -q .; then
+              echo 'Telegram inbox segments must not contain symbolic links.' >&2
+              exit 1
+            fi
+            files+=(tmp/telegram/inbox.json.segments)
+          fi
+          if (( ${#files[@]} )); then
+            tar -czf "$stage/inbox.tar.gz" -C "$agent" "${files[@]}"
+          else
+            tar -czf "$stage/inbox.tar.gz" --files-from /dev/null
+          fi
+          printf '%s\n' "$PI_MEMORY_PASSPHRASE" |
+            gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 \
+              --symmetric --cipher-algo AES256 --s2k-digest-algo SHA512 \
+              --output "$RUNNER_TEMP/pi-telegram-inbox.tar.gz.gpg" "$stage/inbox.tar.gz"
+          chmod 600 "$RUNNER_TEMP/pi-telegram-inbox.tar.gz.gpg"
+
+      - name: Commit changed Pi Hermes memory
+        if: >-
+          always() &&
+          steps.memory-before.outcome == 'success' &&
+          steps.memory-after.outcome == 'success' &&
+          (steps.memory-before.outputs.has_sessions_db == 'true' ||
+           steps.memory-before.outputs.digest != steps.memory-after.outputs.digest)
+        uses: ./.github/actions/dump-pi-memory
+        with:
+          passphrase: ${{ secrets.PI_MEMORY_PASSPHRASE }}
+          archive: .github/pi-memory/pi-hermes-memory.tar.gz.gpg
+
+      - name: Save encrypted Telegram inbox state
+        if: always() && steps.save-inbox-state.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/pi-telegram-inbox.tar.gz.gpg
+          key: pi-telegram-inbox-main-${{ github.run_id }}-${{ github.run_attempt }}

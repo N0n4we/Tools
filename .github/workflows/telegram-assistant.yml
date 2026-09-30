@@ -1,0 +1,595 @@
+name: Telegram assistant
+
+on:
+  workflow_dispatch:
+
+# GitHub keeps at most one pending run for a concurrency group. The overlap
+# guard below discards that pending run if the prior scheduled run crossed its
+# scheduled start time.
+concurrency:
+  group: telegram-assistant-main
+  cancel-in-progress: false
+
+permissions:
+  actions: read
+
+jobs:
+  overlap-guard:
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.guard.outputs.skip }}
+    steps:
+      - name: Skip a scheduled tick overlapped by the previous run
+        id: guard
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const workflowId = "telegram-assistant.yml";
+            const current = await github.rest.actions.getWorkflowRun({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: context.runId,
+            });
+            const response = await github.rest.actions.listWorkflowRuns({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: workflowId,
+              event: "schedule",
+              branch: "main",
+              per_page: 100,
+            });
+            const triggerTime = Date.parse(current.data.created_at);
+            const previous = response.data.workflow_runs
+              .filter((run) => run.id !== context.runId && Date.parse(run.created_at) < triggerTime)
+              .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))[0];
+            // The workflow-runs REST response has no completed_at field. For
+            // completed runs, updated_at is the completion timestamp.
+            const previousFinishedAt = previous?.status === "completed"
+              ? Date.parse(previous.updated_at)
+              : Number.NaN;
+            const skip = Boolean(previous &&
+              (previous.status !== "completed" || previousFinishedAt >= triggerTime) &&
+              context.eventName === "schedule");
+            core.setOutput("skip", String(skip));
+            if (skip) {
+              core.notice("Skipping this tick because the previous scheduled run overlapped its scheduled start.");
+            }
+
+  telegram:
+    needs: overlap-guard
+    if: needs.overlap-guard.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/n0n4we/tools/pi-agent:latest
+      options: --user 0:0
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Validate required repository secrets
+        id: secrets
+        shell: bash
+        env:
+          TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          PI_MEMORY_PASSPHRASE: ${{ secrets.PI_MEMORY_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          : "${TELEGRAM_USER_ID:?Missing repository secret TELEGRAM_USER_ID}"
+          : "${TELEGRAM_BOT_TOKEN:?Missing repository secret TELEGRAM_BOT_TOKEN}"
+          : "${OPENROUTER_API_KEY:?Missing repository secret OPENROUTER_API_KEY}"
+          : "${PI_MEMORY_PASSPHRASE:?Missing repository secret PI_MEMORY_PASSPHRASE}"
+          [[ "$TELEGRAM_USER_ID" =~ ^[1-9][0-9]*$ ]] || {
+            echo 'TELEGRAM_USER_ID must be a positive numeric Telegram user ID.' >&2
+            exit 1
+          }
+
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Expose bundled Pi extensions to the Actions home
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundled_agent=/root/.pi/agent
+          actions_agent="$HOME/.pi/agent"
+          [[ -d "$bundled_agent" ]] || { echo 'Bundled Pi agent directory is missing.' >&2; exit 1; }
+          mkdir -p "$HOME/.pi"
+          if [[ -e "$actions_agent" || -L "$actions_agent" ]]; then
+            [[ -L "$actions_agent" && "$(readlink "$actions_agent")" == "$bundled_agent" ]] || {
+              echo 'Actions home already contains an unexpected Pi agent directory.' >&2
+              exit 1
+            }
+          else
+            ln -s "$bundled_agent" "$actions_agent"
+          fi
+
+      - name: Verify the bundled Pi runtime and extensions
+        shell: bash
+        run: |
+          set -euo pipefail
+          pi --version
+          packages="$(pi list)"
+          printf '%s\n' "$packages"
+          grep -Fq 'npm:@llblab/pi-telegram@0.51.6' <<< "$packages" || {
+            echo 'The bundled pi-telegram extension is not visible to Pi.' >&2
+            exit 1
+          }
+          grep -Fq 'npm:pi-hermes-memory' <<< "$packages" || {
+            echo 'The bundled pi-hermes-memory extension is not visible to Pi.' >&2
+            exit 1
+          }
+
+      # The durable pi-telegram inbox includes pending update payloads, so only
+      # its encrypted archive is stored in Actions cache (never the plaintext).
+      - name: Restore encrypted Telegram inbox state
+        id: inbox-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/pi-telegram-inbox.tar.gz.gpg
+          key: pi-telegram-inbox-main-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            pi-telegram-inbox-main-
+
+      - name: Decrypt and restore Telegram inbox state
+        if: steps.inbox-cache.outputs.cache-matched-key != ''
+        shell: bash
+        env:
+          PI_MEMORY_PASSPHRASE: ${{ secrets.PI_MEMORY_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/pi-telegram-inbox.tar.gz.gpg"
+          stage="$(mktemp -d)"
+          trap 'rm -rf -- "$stage"' EXIT
+          printf '%s\n' "$PI_MEMORY_PASSPHRASE" |
+            gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 \
+              --output "$stage/inbox.tar.gz" --decrypt "$archive"
+
+          while IFS= read -r entry; do
+            entry="${entry#./}"
+            case "$entry" in
+              tmp/telegram/inbox.json|tmp/telegram/inbox.json.segments|tmp/telegram/inbox.json.segments/|tmp/telegram/inbox.json.segments/*) ;;
+              *) echo 'Encrypted Telegram state archive has an unexpected path.' >&2; exit 1 ;;
+            esac
+          done < <(tar -tzf "$stage/inbox.tar.gz")
+
+          mkdir -p "$HOME/.pi/agent"
+          tar -xzf "$stage/inbox.tar.gz" -C "$HOME/.pi/agent" --no-same-owner --no-same-permissions
+          if [[ -L "$HOME/.pi/agent/tmp/telegram/inbox.json" || -L "$HOME/.pi/agent/tmp/telegram/inbox.json.segments" ]] || \
+            find "$HOME/.pi/agent/tmp/telegram/inbox.json.segments" -type l -print -quit 2>/dev/null | grep -q .; then
+            echo 'Telegram inbox state must not contain symbolic links.' >&2
+            exit 1
+          fi
+
+      - name: Restore Pi Hermes memory
+        uses: ./.github/actions/load-pi-memory
+        with:
+          passphrase: ${{ secrets.PI_MEMORY_PASSPHRASE }}
+          archive: .github/pi-memory/pi-hermes-memory.tar.gz.gpg
+
+      - name: Configure the Telegram owner
+        shell: bash
+        env:
+          TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const id = process.env.TELEGRAM_USER_ID;
+          if (!/^[1-9][0-9]*$/.test(id ?? '') || !Number.isSafeInteger(Number(id))) {
+            throw new Error('TELEGRAM_USER_ID must be a positive safe integer.');
+          }
+          const file = path.join(process.env.HOME, '.pi', 'agent', 'telegram.json');
+          fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+          const config = {
+            profiles: {
+              default: {
+                botToken: '$TELEGRAM_BOT_TOKEN',
+                allowedUserId: Number(id),
+              },
+            },
+          };
+          fs.writeFileSync(file, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
+          NODE
+
+      # pi-telegram 0.51.6 uses the v1 base journal schema. An explicit cursor
+      # avoids its first-connect history bootstrap, which could discard pending
+      # updates before this scheduled worker sees them.
+      - name: Initialize the first Telegram inbox cursor
+        id: initialize-cursor
+        shell: bash
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const crypto = require('node:crypto');
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const directory = path.join(process.env.HOME, '.pi', 'agent', 'tmp', 'telegram');
+          const journal = path.join(directory, 'inbox.json');
+          const segments = `${journal}.segments`;
+          const tokenSha256 = crypto.createHash('sha256').update(process.env.TELEGRAM_BOT_TOKEN).digest('hex');
+          fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+          const lstatIfPresent = (file) => {
+            try { return fs.lstatSync(file); }
+            catch (error) { if (error.code === 'ENOENT') return undefined; throw error; }
+          };
+          const journalStat = lstatIfPresent(journal);
+          if (journalStat) {
+            if (!journalStat.isFile() || journalStat.isSymbolicLink()) {
+              throw new Error('Telegram inbox journal has an unexpected file type.');
+            }
+            let existing;
+            try { existing = JSON.parse(fs.readFileSync(journal, 'utf8')); }
+            catch { throw new Error('Telegram inbox journal is not valid JSON; refusing to replace it.'); }
+            if (existing?.version === 1 && existing.profile === 'default' &&
+                existing.botIdentity?.tokenSha256 === tokenSha256 &&
+                Number.isSafeInteger(existing.acceptedThroughUpdateId) && existing.acceptedThroughUpdateId >= 0 &&
+                Array.isArray(existing.entries)) {
+              process.exit(0);
+            }
+            const seedKeys = ['acceptedThroughUpdateId', 'botIdentity', 'entries', 'profile', 'revision', 'version'];
+            const identityKeys = ['tokenSha256'];
+            const isPriorEmptySeed = existing?.version === 3 && existing.revision === 1 &&
+              existing.acceptedThroughUpdateId === 0 && existing.profile === 'default' &&
+              Array.isArray(existing.entries) && existing.entries.length === 0 &&
+              existing.botIdentity?.tokenSha256 === tokenSha256 &&
+              Object.keys(existing).sort().join(',') === seedKeys.join(',') &&
+              Object.keys(existing.botIdentity ?? {}).sort().join(',') === identityKeys.join(',');
+            if (isPriorEmptySeed && !lstatIfPresent(segments) && !fs.lstatSync(directory).isSymbolicLink()) {
+              const corrected = { ...existing, version: 1 };
+              const temporary = `${journal}.${process.pid}.tmp`;
+              fs.writeFileSync(temporary, `${JSON.stringify(corrected)}\n`, { mode: 0o600, flag: 'wx' });
+              fs.renameSync(temporary, journal);
+              console.log('Migrated the empty initial Telegram cursor to pi-telegram v1 schema.');
+              process.exit(0);
+            }
+            throw new Error('Telegram inbox journal schema or identity is unexpected; refusing to replace it.');
+          }
+          if (lstatIfPresent(segments) || fs.lstatSync(directory).isSymbolicLink()) {
+            throw new Error('Telegram inbox journal is incomplete; refusing to replace its state.');
+          }
+          const snapshot = {
+            version: 1,
+            revision: 1,
+            acceptedThroughUpdateId: 0,
+            profile: 'default',
+            botIdentity: {
+              tokenSha256,
+            },
+            entries: [],
+          };
+          const temporary = `${journal}.${process.pid}.tmp`;
+          fs.writeFileSync(temporary, `${JSON.stringify(snapshot)}\n`, { mode: 0o600, flag: 'wx' });
+          fs.renameSync(temporary, journal);
+          NODE
+
+      - name: Snapshot memory before handling messages
+        id: memory-before
+        shell: bash
+        run: |
+          set -euo pipefail
+          directory="$HOME/.pi/agent/pi-hermes-memory"
+          if [[ -d "$directory" ]]; then
+            digest="$(tar --exclude='sessions.db*' --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
+              -cf - -C "$directory" . | sha256sum | cut -d' ' -f1)"
+          else
+            digest=missing
+          fi
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          has_sessions_db=false
+          for file in "$directory"/sessions.db*; do
+            if [[ -e "$file" || -L "$file" ]]; then
+              has_sessions_db=true
+              break
+            fi
+          done
+          echo "has_sessions_db=$has_sessions_db" >> "$GITHUB_OUTPUT"
+
+      - name: Connect Pi and process Telegram updates
+        shell: bash
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          PI_TELEGRAM_MODEL: openrouter/stealth/space-bunny-alpha
+        run: |
+          set -euo pipefail
+          workspace="$RUNNER_TEMP/pi-telegram-workspace"
+          mkdir -p "$workspace"
+          node --input-type=module <<'NODE'
+          import { spawn } from 'node:child_process';
+          import { existsSync, readFileSync } from 'node:fs';
+          import { homedir } from 'node:os';
+          import path from 'node:path';
+          import readline from 'node:readline';
+
+          const agentDir = path.join(homedir(), '.pi', 'agent');
+          const telegramDir = path.join(agentDir, 'tmp', 'telegram');
+          const journalPath = path.join(telegramDir, 'inbox.json');
+          const statusPath = path.join(telegramDir, 'state.json');
+          const startTime = Date.now();
+          const idleTimeoutMs = 5 * 60 * 1000;
+          const initialJournal = readJson(journalPath);
+          const hadCursor = Number.isSafeInteger(initialJournal?.acceptedThroughUpdateId);
+          let lastResponseAt;
+          let lastResponseCount;
+          let sawUpdates = false;
+          let lastMessageAt;
+          let activeAgent = false;
+          let connected = false;
+          let finished = false;
+          let stderrSeen = false;
+          let stderrText = '';
+          let sawAgentStart = false;
+          const recentRpcEvents = [];
+          const extensionFailures = [];
+          let connectResponse = 'not-received';
+          let failure;
+
+          if (!hadCursor) throw new Error('Telegram inbox cursor is not initialized.');
+
+          const child = spawn('pi', [
+            '--mode', 'rpc',
+            '--model', process.env.PI_TELEGRAM_MODEL,
+          ], {
+            cwd: path.join(process.env.RUNNER_TEMP, 'pi-telegram-workspace'),
+            env: process.env,
+            stdio: ['pipe', 'pipe', 'pipe'],
+          });
+          child.stderr.on('data', (chunk) => {
+            stderrSeen ||= chunk.length > 0;
+            stderrText = `${stderrText}${chunk.toString('utf8')}`.slice(-16_384);
+          });
+          child.once('error', () => { failure = new Error('Pi could not be started.'); });
+          child.once('close', (code) => {
+            if (!finished && code !== 0) failure ??= new Error('Pi exited before polling completed.');
+          });
+
+          function send(command) {
+            if (!child.stdin.destroyed && child.stdin.writable) {
+              child.stdin.write(`${JSON.stringify(command)}\n`);
+            }
+          }
+
+          const lines = readline.createInterface({ input: child.stdout });
+          lines.on('line', (line) => {
+            let event;
+            try { event = JSON.parse(line); } catch { return; }
+            if (typeof event.type === 'string') {
+              const label = `${safeLabel(event.type)}${event.method ? `:${safeLabel(event.method)}` : ''}`;
+              recentRpcEvents.push(label);
+              if (recentRpcEvents.length > 20) recentRpcEvents.shift();
+            }
+            if (event.type === 'extension_error') {
+              const error = event.error;
+              const message = typeof error === 'string' ? error : error?.message ?? error?.name ?? event.message;
+              extensionFailures.push(classifyDiagnostic(message));
+              if (extensionFailures.length > 8) extensionFailures.shift();
+            }
+            if (event.type === 'agent_start') { activeAgent = true; sawAgentStart = true; }
+            if (event.type === 'agent_settled') activeAgent = false;
+            if (event.type === 'extension_ui_request' && event.method === 'confirm') {
+              send({ type: 'extension_ui_response', id: event.id, cancelled: true });
+            }
+            if (event.id === 'telegram-connect' && event.type === 'response') {
+              connectResponse = event.success === false ? 'failed' : 'received';
+              if (event.success === false) failure = new Error('Pi Telegram connection command failed.');
+            }
+          });
+
+          function readJson(file) {
+            try { return JSON.parse(readFileSync(file, 'utf8')); } catch { return undefined; }
+          }
+
+          function getPendingCount() {
+            const journal = readJson(journalPath);
+            return Array.isArray(journal?.entries) ? journal.entries.length : 0;
+          }
+
+          function getPollingState() {
+            const status = readJson(statusPath);
+            return status?.runtime?.polling;
+          }
+
+          function wait(ms) {
+            return new Promise((resolve) => setTimeout(resolve, ms));
+          }
+
+          function safeLabel(value) {
+            return typeof value === 'string' && /^[a-z0-9_-]{1,40}$/i.test(value) ? value : 'unknown';
+          }
+
+          function classifyDiagnostic(value) {
+            const message = String(value ?? '').toLowerCase();
+            if (/\b401\b|unauthorized|invalid bot token|token rejected/.test(message)) return 'auth';
+            if (/\b409\b|terminated by other getupdates|poller conflict/.test(message)) return 'poller-conflict';
+            if (/\b429\b|too many requests|rate limit/.test(message)) return 'rate-limited';
+            if (/enotfound|eai_again|econn|etimedout|network|fetch failed|socket/.test(message)) return 'network';
+            if (/environment variable .*not set|missing .*environment|environment .*missing/.test(message)) return 'missing-env';
+            if (/cannot find (module|package)|module not found|enoent|no such file/.test(message)) return 'missing-file-or-module';
+            if (/permission denied|eacces|eperm/.test(message)) return 'permission';
+            if (/timeout|timed out/.test(message)) return 'timeout';
+            if (/invalid|malformed|syntaxerror|parse error/.test(message)) return 'invalid-config-or-state';
+            return /error|failed|exception/.test(message) ? 'other-error' : 'info';
+          }
+
+          function safeDiagnosticText(value) {
+            let message = String(value ?? '');
+            for (const secret of [process.env.TELEGRAM_BOT_TOKEN, process.env.OPENROUTER_API_KEY]) {
+              if (secret) message = message.split(secret).join('[redacted]');
+            }
+            return message.replace(/https?:\/\/\S+/g, '[url]').replace(/\s+/g, ' ').slice(0, 180);
+          }
+
+          function getSafeDiagnostics() {
+            const logPath = path.join(telegramDir, 'logs.jsonl');
+            let events = [];
+            try {
+              events = readFileSync(logPath, 'utf8').trim().split('\n')
+                .filter(Boolean).map((line) => JSON.parse(line))
+                .filter((event) => event.kind === 'event');
+            } catch { /* diagnostics are optional */ }
+            const runtime = events.slice(-12).map((event) => {
+              const summary = `${safeLabel(event.category)}:${safeLabel(event.details?.phase)}:${classifyDiagnostic(event.message)}`;
+              return event.category === 'connection' ? `${summary}:${safeDiagnosticText(event.message)}` : summary;
+            });
+            const polling = getPollingState();
+            return `status=${existsSync(statusPath) ? safeLabel(polling?.phase) : 'missing'}, agent-start=${sawAgentStart}, rpc=${recentRpcEvents.join(',') || 'none'}, extension-errors=${extensionFailures.join(',') || 'none'}, runtime=${runtime.join(',') || 'none'}, stderr=${classifyDiagnostic(stderrText)}`;
+          }
+
+          async function shutdown() {
+            finished = true;
+            lines.close();
+            if (child.exitCode !== null || child.killed) return;
+            const closed = new Promise((resolve) => child.once('close', resolve));
+            child.stdin.end();
+            const forcedStop = setTimeout(() => child.kill('SIGTERM'), 15_000);
+            await closed;
+            clearTimeout(forcedStop);
+          }
+
+          try {
+            send({ id: 'telegram-connect', type: 'prompt', message: '/telegram-connect' });
+            const startupDeadline = Date.now() + 120_000;
+            while (Date.now() < startupDeadline) {
+              if (failure) throw failure;
+              const polling = getPollingState();
+              if (Number.isFinite(polling?.startedAtMs) && polling.startedAtMs >= startTime - 5_000) {
+                connected = true;
+                break;
+              }
+              if (child.exitCode !== null) throw new Error('Pi exited before Telegram polling started.');
+              await wait(500);
+            }
+            if (!connected) {
+              const polling = getPollingState();
+              throw new Error(`Pi Telegram polling did not start within two minutes (connect=${connectResponse}, phase=${safeLabel(polling?.phase)}, stop=${safeLabel(polling?.stopReason)}, stderr=${stderrSeen ? 'present' : 'empty'}).`);
+            }
+            lastMessageAt = Date.now();
+            const firstResponseDeadline = Date.now() + 90_000;
+
+            while (true) {
+              if (failure) throw failure;
+              if (child.exitCode !== null) throw new Error('Pi exited before completing the Telegram polling cycle.');
+              const polling = getPollingState();
+              if (polling?.phase === 'stopped' && polling?.stopReason === 'persistent-conflict') {
+                throw new Error('Another Telegram getUpdates poller owns this bot token.');
+              }
+              if (polling?.phase === 'stopped' && polling?.startedAtMs >= startTime &&
+                  polling?.stopReason && polling.stopReason !== 'requested') {
+                throw new Error('Pi Telegram polling stopped unexpectedly.');
+              }
+              const responseAt = polling?.lastSuccessfulResponseAtMs;
+              const responseCount = polling?.lastSuccessfulResponseUpdateCount;
+              if (Number.isFinite(responseAt) && responseAt !== lastResponseAt) {
+                lastResponseAt = responseAt;
+                lastResponseCount = Number.isSafeInteger(responseCount) ? responseCount : 0;
+                if (lastResponseCount > 0) {
+                  sawUpdates = true;
+                  lastMessageAt = responseAt;
+                }
+              }
+              if (!Number.isFinite(lastResponseAt) && Date.now() > firstResponseDeadline) {
+                throw new Error('Pi Telegram polling did not receive its first update response.');
+              }
+
+              // Wait for an empty long-poll response completed after five idle
+              // minutes; the previous empty response may predate a new message.
+              if (Number.isFinite(lastMessageAt) && Number.isFinite(lastResponseAt) &&
+                  lastResponseCount === 0 && lastResponseAt >= lastMessageAt + idleTimeoutMs &&
+                  !activeAgent && getPendingCount() === 0) {
+                break;
+              }
+              await wait(500);
+            }
+            await shutdown();
+            console.log(sawUpdates
+              ? 'Telegram updates were processed; Pi has been shut down cleanly.'
+              : 'No new Telegram updates; Pi has been shut down cleanly.');
+          } catch (error) {
+            await shutdown();
+            console.error(`Pi Telegram diagnostics: ${getSafeDiagnostics()}`);
+            // Deliberately omit provider responses, Telegram text, and raw errors.
+            console.error(error?.message || 'Pi Telegram worker failed.');
+            process.exitCode = 1;
+          }
+          NODE
+
+      - name: Snapshot memory after handling messages
+        id: memory-after
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          directory="$HOME/.pi/agent/pi-hermes-memory"
+          if [[ -d "$directory" ]]; then
+            digest="$(tar --exclude='sessions.db*' --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
+              -cf - -C "$directory" . | sha256sum | cut -d' ' -f1)"
+          else
+            digest=missing
+          fi
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Encrypt Telegram inbox state for the next run
+        id: save-inbox-state
+        if: always() && steps.secrets.outcome == 'success' && steps.initialize-cursor.outcome == 'success'
+        shell: bash
+        env:
+          PI_MEMORY_PASSPHRASE: ${{ secrets.PI_MEMORY_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          agent="$HOME/.pi/agent"
+          state="$agent/tmp/telegram"
+          stage="$(mktemp -d)"
+          trap 'rm -rf -- "$stage"' EXIT
+          mkdir -p "$state"
+
+          files=()
+          journal="$state/inbox.json"
+          segments="$journal.segments"
+          if [[ -e "$journal" || -L "$journal" ]]; then
+            [[ -f "$journal" && ! -L "$journal" ]] || { echo 'Telegram inbox journal has an unexpected file type.' >&2; exit 1; }
+            files+=(tmp/telegram/inbox.json)
+          fi
+          if [[ -e "$segments" || -L "$segments" ]]; then
+            [[ -d "$segments" && ! -L "$segments" ]] || { echo 'Telegram inbox segments have an unexpected file type.' >&2; exit 1; }
+            if find "$segments" -type l -print -quit | grep -q .; then
+              echo 'Telegram inbox segments must not contain symbolic links.' >&2
+              exit 1
+            fi
+            files+=(tmp/telegram/inbox.json.segments)
+          fi
+          if (( ${#files[@]} )); then
+            tar -czf "$stage/inbox.tar.gz" -C "$agent" "${files[@]}"
+          else
+            tar -czf "$stage/inbox.tar.gz" --files-from /dev/null
+          fi
+          printf '%s\n' "$PI_MEMORY_PASSPHRASE" |
+            gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 \
+              --symmetric --cipher-algo AES256 --s2k-digest-algo SHA512 \
+              --output "$RUNNER_TEMP/pi-telegram-inbox.tar.gz.gpg" "$stage/inbox.tar.gz"
+          chmod 600 "$RUNNER_TEMP/pi-telegram-inbox.tar.gz.gpg"
+
+      - name: Commit changed Pi Hermes memory
+        if: >-
+          always() &&
+          steps.memory-before.outcome == 'success' &&
+          steps.memory-after.outcome == 'success' &&
+          (steps.memory-before.outputs.has_sessions_db == 'true' ||
+           steps.memory-before.outputs.digest != steps.memory-after.outputs.digest)
+        uses: ./.github/actions/dump-pi-memory
+        with:
+          passphrase: ${{ secrets.PI_MEMORY_PASSPHRASE }}
+          archive: .github/pi-memory/pi-hermes-memory.tar.gz.gpg
+
+      - name: Save encrypted Telegram inbox state
+        if: always() && steps.save-inbox-state.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/pi-telegram-inbox.tar.gz.gpg
+          key: pi-telegram-inbox-main-${{ github.run_id }}-${{ github.run_attempt }}

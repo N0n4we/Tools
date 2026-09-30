@@ -1,0 +1,1 @@
+Internal nudge from the harness, not a Telegram message. The user has still not confirmed being awake, or their last reply left you unsure. Reply as your final reply with one short Chinese nudge in fresh wording plus one short voice clip, and do not call `telegram_message` and do not write the completion file.
