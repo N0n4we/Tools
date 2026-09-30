@@ -1,0 +1,74 @@
+name: Dump Pi Hermes memory
+description: Encrypt the Pi Hermes memory directory, then commit and push the caller-selected archive to main.
+inputs:
+  passphrase:
+    description: Passphrase stored in the PI_MEMORY_PASSPHRASE repository secret.
+    required: true
+  archive:
+    description: Caller-provided destination path for the encrypted memory archive.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Archive and encrypt memory
+      shell: bash
+      env:
+        PI_MEMORY_PASSPHRASE: ${{ inputs.passphrase }}
+        PI_MEMORY_ARCHIVE: ${{ inputs.archive }}
+      run: |
+        set -euo pipefail
+        : "${PI_MEMORY_PASSPHRASE:?PI_MEMORY_PASSPHRASE is required}"
+        source_dir="$HOME/.pi/agent/pi-hermes-memory"
+        [[ -d "$source_dir" ]] || { echo "Pi Hermes memory directory not found: $source_dir" >&2; exit 1; }
+
+        stage="$(mktemp -d)"
+        trap 'rm -rf -- "$stage"' EXIT
+        tar -czf "$stage/pi-hermes-memory.tar.gz" -C "$HOME/.pi/agent" pi-hermes-memory
+        printf '%s\n' "$PI_MEMORY_PASSPHRASE" |
+          gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 \
+            --symmetric --cipher-algo AES256 --s2k-digest-algo SHA512 \
+            --output "$stage/pi-hermes-memory.tar.gz.gpg" "$stage/pi-hermes-memory.tar.gz"
+
+        mkdir -p "$(dirname "$PI_MEMORY_ARCHIVE")"
+        mv -f -- "$stage/pi-hermes-memory.tar.gz.gpg" "$PI_MEMORY_ARCHIVE"
+        echo "Encrypted Pi Hermes memory to $PI_MEMORY_ARCHIVE"
+    - name: Install jj
+      shell: bash
+      run: |
+        set -euo pipefail
+        case "$(uname -m)" in
+          x86_64) arch=x86_64; sha256=f35438350b5d61963aac5dd74ede510b31d6b9690769d1a6268cf058cc825f72 ;;
+          aarch64) arch=aarch64; sha256=7349a43dd5a20dbc998b10114daa0ee63d2ab863fb822c7eb6b0ebca5903cc69 ;;
+          *) echo 'Unsupported runner architecture' >&2; exit 1 ;;
+        esac
+        url="https://github.com/jj-vcs/jj/releases/download/v0.45.1/jj-v0.45.1-${arch}-unknown-linux-musl.tar.gz"
+        stage="$(mktemp -d)"
+        trap 'rm -rf -- "$stage"' EXIT
+        curl -fsSL "$url" -o "$stage/jj.tar.gz"
+        echo "$sha256  $stage/jj.tar.gz" | sha256sum -c -
+        tar -xzf "$stage/jj.tar.gz" -C "$stage" ./jj
+        mkdir -p "$RUNNER_TEMP/jj-bin"
+        install -m 755 "$stage/jj" "$RUNNER_TEMP/jj-bin/jj"
+        echo "$RUNNER_TEMP/jj-bin" >> "$GITHUB_PATH"
+    - name: Commit and push encrypted memory to main
+      shell: bash
+      env:
+        PI_MEMORY_ARCHIVE: ${{ inputs.archive }}
+      run: |
+        set -euo pipefail
+        jj --config snapshot.max-new-file-size=95000000 git init --colocate
+        jj --config snapshot.max-new-file-size=95000000 config set --repo snapshot.max-new-file-size 95000000
+        archive_path="$(realpath --relative-to="$GITHUB_WORKSPACE" "$PI_MEMORY_ARCHIVE")"
+        case "$archive_path" in
+          ..|../*|/*) echo 'PI_MEMORY_ARCHIVE must be inside the checked-out repository' >&2; exit 1 ;;
+        esac
+        if [[ ! -f "$PI_MEMORY_ARCHIVE" || -L "$PI_MEMORY_ARCHIVE" || "$(jj diff --name-only)" != "$archive_path" ]]; then
+          echo 'Refusing to commit anything except the encrypted memory archive' >&2
+          exit 1
+        fi
+        jj config set --repo user.name '"github-actions[bot]"'
+        jj config set --repo user.email '"41898282+github-actions[bot]@users.noreply.github.com"'
+        jj metaedit --update-author
+        jj describe -m 'Update Pi Hermes memory backup'
+        jj bookmark set main -r @
+        jj git push --remote origin --bookmark main

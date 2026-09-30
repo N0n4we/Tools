@@ -1,0 +1,49 @@
+name: Load Pi Hermes memory
+description: Decrypt and restore the Pi Hermes memory directory on this runner.
+inputs:
+  passphrase:
+    description: Passphrase stored in the PI_MEMORY_PASSPHRASE repository secret.
+    required: true
+  archive:
+    description: Caller-provided path to the encrypted Pi Hermes memory archive.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Decrypt and restore memory
+      shell: bash
+      env:
+        PI_MEMORY_PASSPHRASE: ${{ inputs.passphrase }}
+        PI_MEMORY_ARCHIVE: ${{ inputs.archive }}
+      run: |
+        set -euo pipefail
+        : "${PI_MEMORY_PASSPHRASE:?PI_MEMORY_PASSPHRASE is required}"
+        [[ -f "$PI_MEMORY_ARCHIVE" ]] || { echo "Encrypted memory archive not found: $PI_MEMORY_ARCHIVE" >&2; exit 1; }
+
+        parent="$HOME/.pi/agent"
+        target="$parent/pi-hermes-memory"
+        mkdir -p "$parent"
+        stage="$(mktemp -d "$parent/.pi-hermes-memory-load.XXXXXX")"
+        backup="$(mktemp -d "$parent/.pi-hermes-memory-backup.XXXXXX")"
+        cleanup() {
+          if [[ ! -e "$target" && ! -L "$target" && ( -e "$backup/pi-hermes-memory" || -L "$backup/pi-hermes-memory" ) ]]; then
+            mv "$backup/pi-hermes-memory" "$target"
+          fi
+          rm -rf -- "$stage" "$backup"
+        }
+        trap cleanup EXIT
+
+        printf '%s\n' "$PI_MEMORY_PASSPHRASE" |
+          gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 \
+            --output "$stage/memory.tar.gz" --decrypt "$PI_MEMORY_ARCHIVE"
+        tar -xzf "$stage/memory.tar.gz" -C "$stage" --no-same-owner
+        [[ -d "$stage/pi-hermes-memory" && ! -L "$stage/pi-hermes-memory" ]] || {
+          echo 'Archive has no regular pi-hermes-memory directory' >&2
+          exit 1
+        }
+
+        if [[ -e "$target" || -L "$target" ]]; then
+          mv "$target" "$backup/pi-hermes-memory"
+        fi
+        mv "$stage/pi-hermes-memory" "$target"
+        echo "Restored Pi Hermes memory to $target"
