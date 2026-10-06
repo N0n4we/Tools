@@ -249,7 +249,7 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          PI_TELEGRAM_MODEL: openrouter/stealth/space-bunny-alpha
+          PI_TELEGRAM_MODEL: openrouter/xiaomi/mimo-v2.6-flash
           PI_WAKEUP_COMPLETED_FILE: ${{ runner.temp }}/pi-telegram-wakeup-confirmed
         run: |
           set -euo pipefail

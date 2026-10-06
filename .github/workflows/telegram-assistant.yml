@@ -296,7 +296,7 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          PI_TELEGRAM_MODEL: openrouter/stealth/space-bunny-alpha
+          PI_TELEGRAM_MODEL: openrouter/xiaomi/mimo-v2.6-flash
         run: |
           set -euo pipefail
           workspace="$RUNNER_TEMP/pi-telegram-workspace"
