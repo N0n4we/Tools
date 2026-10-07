@@ -1,0 +1,22 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "pi-durable-telegram-agent",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-30",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "vars": {
+    "PI_MODEL": "xiaomi/mimo-v2.6-flash",
+    "MEMORY_PREFIX": "hermes/",
+    "WEB_SEARCH_PROVIDER": "brave"
+  },
+  "durable_objects": {
+    "bindings": [{ "name": "AGENT", "class_name": "AgentBackend" }]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["AgentBackend"] }
+  ],
+  // Cloudflare Cron uses UTC: 22:00 UTC = 06:00 Asia/Shanghai the next day.
+  "triggers": { "crons": ["0 22 * * *"] },
+  "observability": { "enabled": true }
+}

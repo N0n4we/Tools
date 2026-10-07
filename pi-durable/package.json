@@ -1,0 +1,35 @@
+{
+  "name": "pi-durable-telegram-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.20.0",
+  "engines": { "node": ">=22.19.0" },
+  "scripts": {
+    "dev": "wrangler dev --local",
+    "check": "tsc --noEmit",
+    "test": "vitest run",
+    "build": "wrangler deploy --dry-run --outdir dist",
+    "memory:inspect": "node scripts/import-memory.mjs --dry-run",
+    "memory:import": "node scripts/import-memory.mjs",
+    "telegram:webhook": "node scripts/set-webhook.mjs"
+  },
+  "dependencies": {
+    "@earendil-works/chord": "1.0.4",
+    "@earendil-works/pi-ai": "1.0.4",
+    "@earendil-works/pi-durable": "1.0.4",
+    "htmlparser2": "10.0.0",
+    "ipaddr.js": "2.2.0",
+    "typebox": "1.3.27",
+    "yaml": "2.9.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20261007.1",
+    "@types/node": "^22.0.0",
+    "esbuild": "0.28.2",
+    "miniflare": "4.20260730.0",
+    "typescript": "5.9.3",
+    "vitest": "4.1.11",
+    "wrangler": "^4.0.0"
+  }
+}
