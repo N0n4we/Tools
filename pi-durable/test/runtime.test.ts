@@ -5,23 +5,21 @@ import { createHash } from "node:crypto";
 import { beforeAll, afterAll, describe, expect, it } from "vitest";
 import { build } from "esbuild";
 import { Miniflare } from "miniflare";
-import { collectMemoryFiles } from "../scripts/memory-files.mjs";
 import { MAX_FILE_BYTES } from "../src/memory/store.js";
 
-const admin = "test-admin-token-at-least-thirty-two-characters";
 const webhook = "test-webhook-secret";
 const received: { text: string; chat_id: number }[] = [];
 const outbound: string[] = [];
 const voices: { chatId: string; bytes: number; replyTo?: number }[] = [];
+const compactHistory = Array.from({ length: 6 }, (_, index) => `old-fact-${index}\n${"history ".repeat(4000)}`);
 let speechCalls = 0;
 let ambiguousVoiceOnce = false;
 let rejectOnce = false;
 let ambiguousOnce = false;
-let webhookUrl = "";
-let webhookRejectOnce = false;
 let mf: Miniflare;
 let directory: string;
 let bundle: string;
+let migrationBundle: string;
 
 async function responseJSON(response: Response) {
   const text = await response.text();
@@ -29,12 +27,12 @@ async function responseJSON(response: Response) {
   catch { throw new Error(`Worker returned non-JSON (HTTP ${response.status}): ${text.slice(0, 1500)}`); }
 }
 
-async function runtime(className = "TestAgent", state = "default") {
+async function runtime(className = "TestAgent", state = "default", script = bundle) {
   const instance = new Miniflare({
-    modules: [{ type: "ESModule", path: bundle }], modulesRoot: directory,
+    modules: [{ type: "ESModule", path: script }], modulesRoot: directory,
     compatibilityDate: "2026-07-30", compatibilityFlags: ["nodejs_compat"],
-    durableObjects: { AGENT: { className, useSQLite: true } }, durableObjectsPersist: path.join(directory, state, "objects"),
-    bindings: { TELEGRAM_USER_ID: "123", TELEGRAM_BOT_TOKEN: "test-bot", TELEGRAM_WEBHOOK_SECRET: webhook, OPENROUTER_API_KEY: "not-a-real-key", AGENT_ADMIN_TOKEN: admin, MEMORY_PREFIX: "hermes/" },
+    durableObjects: { AGENT: { className, useSQLite: true, unsafeUniqueKey: "pi-durable-test-agent" } }, durableObjectsPersist: path.join(directory, state, "objects"),
+    bindings: { TELEGRAM_USER_ID: "123", TELEGRAM_BOT_TOKEN: "test-bot", TELEGRAM_WEBHOOK_SECRET: webhook, OPENROUTER_API_KEY: "not-a-real-key", MEMORY_PREFIX: "hermes/" },
     outboundService: async (request) => {
       const url = new URL(request.url);
       outbound.push(url.hostname);
@@ -61,23 +59,6 @@ async function runtime(className = "TestAgent", state = "default") {
         received.push(await request.json() as { text: string; chat_id: number });
         return Response.json({ ok: true, result: { message_id: received.length } });
       }
-      if (url.hostname === "api.telegram.org" && url.pathname.startsWith("/bottest-bot/")) {
-        const method = url.pathname.split("/").at(-1);
-        if (method === "getMe") return Response.json({ ok: true, result: { id: 789, is_bot: true, username: "test_bot" } });
-        if (method === "getChat") return Response.json({ ok: true, result: { id: 123, type: "private" } });
-        if (method === "getWebhookInfo") return Response.json({ ok: true, result: { url: webhookUrl, pending_update_count: 0 } });
-        if (method === "setWebhook") {
-          if (webhookRejectOnce) {
-            webhookRejectOnce = false;
-            return Response.json({ ok: false, error_code: 400, description: `Bad webhook: failed to resolve host ${admin} ${webhook}` }, { status: 400 });
-          }
-          const body = await request.json() as { url: string; secret_token: string; drop_pending_updates: boolean };
-          expect(body.secret_token).toBe(webhook);
-          expect(body.drop_pending_updates).toBe(false);
-          webhookUrl = body.url;
-          return Response.json({ ok: true, result: true });
-        }
-      }
       if (url.hostname === "cloudflare-dns.com") return Response.json({ Status: 0, Answer: url.searchParams.get("type") === "A" ? [{ type: 1, data: "8.8.8.8" }] : [] });
       if (url.hostname === "example.com") return new Response("<title>Fixture</title><article><p>公开网页正文</p></article>", { headers: { "content-type": "text/html" } });
       if (url.hostname === "openrouter.ai" && url.pathname === "/api/v1/chat/completions") {
@@ -95,9 +76,10 @@ async function runtime(className = "TestAgent", state = "default") {
   return instance;
 }
 
-async function api(route: string, method = "GET", body?: unknown, authorization = true) {
-  const response = await mf.dispatchFetch(`https://agent.invalid${route}`, {
-    method, headers: { ...(authorization ? { authorization: `Bearer ${admin}` } : {}), ...(body === undefined ? {} : { "content-type": "application/json" }) },
+async function probe(route: string, method = "GET", body?: unknown) {
+  const namespace = await mf.getDurableObjectNamespace("AGENT");
+  const response = await namespace.get(namespace.idFromName("123")).fetch(`https://agent.internal${route}`, {
+    method, ...(body === undefined ? {} : { headers: { "content-type": "application/json" } }),
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   });
   return { status: response.status, body: await responseJSON(response) };
@@ -113,8 +95,8 @@ async function telegram(updateId: number, text: string, from = 123, secret = web
 
 async function waitJob(id: string) {
   for (let i = 0; i < 100; i++) {
-    const result = await api(`/api/jobs/${id}`);
-    if (result.body.status === "complete" || result.body.status === "failed") return result.body;
+    const result = await probe(`/test/jobs/${id}`);
+    if (result.body?.status === "complete" || result.body?.status === "failed") return result.body;
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   throw new Error("Local job did not finish");
@@ -124,38 +106,30 @@ beforeAll(async () => {
   directory = await fs.mkdtemp(path.join(os.tmpdir(), "pi-agent-tests-"));
   bundle = path.join(directory, "worker.js");
   await build({ entryPoints: ["test/runtime.worker.ts"], outfile: bundle, bundle: true, format: "esm", platform: "browser", target: "es2022", conditions: ["workerd", "worker", "browser"], external: ["node:*", "cloudflare:*"], logLevel: "silent" });
+  migrationBundle = path.join(directory, "migration.js");
+  await build({ entryPoints: ["scripts/migrate-files.worker.ts"], outfile: migrationBundle, bundle: true, format: "esm", platform: "browser", target: "es2022", conditions: ["workerd", "worker", "browser"], external: ["node:*", "cloudflare:*"], logLevel: "silent" });
   mf = await runtime();
 }, 30_000);
 
 afterAll(async () => { await mf?.dispose(); if (directory) await fs.rm(directory, { recursive: true, force: true }); });
 
 describe.sequential("real local Workers / SQLite Durable Object (no R2 binding)", () => {
-  it("has a public health check but protects administration and webhook", async () => {
-    expect((await api("/health", "GET", undefined, false)).status).toBe(200);
-    expect((await api("/api/memory/files", "GET", undefined, false)).status).toBe(401);
+  it("exposes only POST /telegram/webhook and protects it", async () => {
+    for (const [method, route] of [
+      ["GET", "/"], ["GET", "/health"],
+      ["GET", "/api/telegram/status"], ["GET", "/api/telegram/latest"], ["POST", "/api/telegram/webhook"],
+      ["POST", "/api/chat"], ["GET", `/api/jobs/${"a".repeat(64)}`],
+      ["GET", "/api/memory/files"], ["GET", "/api/memory/file?path=MEMORY.md"], ["PUT", "/api/memory/file?path=MEMORY.md"],
+      ["GET", "/api/wakeup"], ["POST", "/api/wakeup"], ["DELETE", "/api/wakeup"],
+      ["POST", "/enqueue"], ["POST", "/wakeup"], ["GET", "/memory/files"],
+      ["GET", "/test/memory/file?path=MEMORY.md"], ["GET", "/test/wakeup"], ["GET", `/test/jobs/${"a".repeat(64)}`],
+      ["GET", "/telegram/webhook"], ["PUT", "/telegram/webhook"], ["DELETE", "/telegram/webhook"], ["OPTIONS", "/telegram/webhook"],
+    ]) {
+      const response = await mf.dispatchFetch(`https://agent.invalid${route}`, { method, headers: { authorization: "Bearer obsolete-admin-token-at-least-32-characters" } });
+      expect(response.status, `${method} ${route}`).toBe(404);
+    }
     expect((await telegram(1, "hello", 123, "wrong-secret")).status).toBe(401);
     expect((await telegram(1, "hello", 456)).body.ignored).toBe(true);
-  });
-
-  it("protects Telegram administration and registers only the current Worker origin", async () => {
-    expect((await api("/api/telegram/status", "GET", undefined, false)).status).toBe(401);
-    expect((await api("/api/telegram/latest", "GET", undefined, false)).status).toBe(401);
-    expect((await api("/api/telegram/latest")).body).toEqual({ job: null });
-    expect((await api("/api/telegram/webhook", "POST", { confirm: true }, false)).status).toBe(401);
-    expect((await api("/api/telegram/webhook", "POST", {})).status).toBe(400);
-    const status = await api("/api/telegram/status");
-    expect(status.body.ownerChatReady).toBe(true);
-    expect((await api("/api/telegram/webhook", "POST", { confirm: true, url: "https://not-the-worker.example/telegram/webhook" })).body.url).toBe("https://agent.invalid/telegram/webhook");
-    expect((await api("/api/telegram/status")).body.webhook.url).toBe("https://agent.invalid/telegram/webhook");
-  });
-
-  it("returns safe Telegram setup diagnostics without exposing provider descriptions", async () => {
-    webhookRejectOnce = true;
-    const result = await api("/api/telegram/webhook", "POST", { confirm: true });
-    expect(result.status).toBe(502);
-    expect(result.body).toEqual({ error: "Telegram API request failed", errorCode: 400, reason: "webhook_dns_failed", retryable: false, uncertain: false });
-    expect(JSON.stringify(result.body)).not.toContain(admin);
-    expect(JSON.stringify(result.body)).not.toContain(webhook);
   });
 
   it("executes a real Pi Durable tool and deduplicates incoming Telegram updates", async () => {
@@ -167,10 +141,7 @@ describe.sequential("real local Workers / SQLite Durable Object (no R2 binding)"
     expect(job.status, `${job.error}; outbound: ${outbound.join(",")}`).toBe("complete");
     expect(job.submissionId).toBeTypeOf("number");
     expect(received.length).toBe(before + 1);
-    expect((await api("/api/telegram/latest")).body).toEqual({ job: {
-      id: job.id, status: "complete", createdAt: job.createdAt, sentIds: job.sentIds,
-    } });
-    const memory = await api("/api/memory/file?path=MEMORY.md");
+    const memory = await probe("/test/memory/file?path=MEMORY.md");
     expect(memory.body.content.match(/测试用户喜欢简洁回答/g)).toHaveLength(1);
   });
 
@@ -178,16 +149,90 @@ describe.sequential("real local Workers / SQLite Durable Object (no R2 binding)"
     expect((await telegram(42, "different input")).status).toBe(409);
   });
 
+  it("handles short /compact without generating a chat reply and keeps Telegram access controls", async () => {
+    const previous = mf;
+    mf = await runtime("TestAgent", "compact-short");
+    try {
+      expect((await telegram(1, "/compact", 456)).body.ignored).toBe(true);
+      expect((await telegram(1, "/compact", 123, "wrong-secret")).status).toBe(401);
+      const queued = await telegram(1, " /compact\n");
+      const job = await waitJob(queued.body.id);
+      expect(job).toMatchObject({ kind: "compact", status: "complete", compactionTaskId: expect.any(Number), parts: ["当前上下文较短，无需压缩。"] });
+      expect(job.submissionId).toBeUndefined();
+      expect(job.speech).toBeUndefined();
+      expect((await probe("/test/context")).body.context.messages).toEqual([]);
+      const normal = await telegram(2, "/compactness");
+      expect(await waitJob(normal.body.id)).toMatchObject({ kind: "user", parts: ["本地测试回答。"] });
+    } finally { await mf.dispose(); mf = previous; }
+  });
+
+  it("places a manual compaction summary, preserves history/files and deduplicates across restart", async () => {
+    const previous = mf;
+    mf = await runtime("TestAgent", "compact-history");
+    try {
+      expect((await probe("/test/context", "PUT", compactHistory)).status).toBe(200);
+      const memory = (await probe("/test/memory/file?path=MEMORY.md", "PUT", { content: "保留长期记忆", etag: null })).body;
+      const before = received.length;
+      rejectOnce = true;
+      const [queued, duplicate] = await Promise.all([telegram(1, "/compact"), telegram(1, "/compact")]);
+      expect(queued.status).toBe(200);
+      expect(duplicate.body.id).toBe(queued.body.id);
+      const job = await waitJob(queued.body.id);
+      expect(job).toMatchObject({ kind: "compact", status: "complete", parts: ["上下文已压缩，历史记录和记忆文件已保留。"] });
+      expect(received.length).toBe(before + 1);
+      expect(received.at(-1)).toMatchObject({ chat_id: 123, reply_parameters: { message_id: 2 } });
+      const view = (await probe("/test/context")).body;
+      expect(view.context.head).toMatchObject({ kind: "pi.compaction", data: { reason: "manual" } });
+      expect(JSON.stringify(view.context.messages)).toContain("测试压缩摘要");
+      expect(JSON.stringify(view.context.messages)).not.toContain("old-fact-0");
+      expect(view.entries.filter((entry: { kind: string }) => entry.kind === "pi.user")).toHaveLength(compactHistory.length);
+      expect(JSON.stringify(view.entries)).toContain("old-fact-0");
+      expect(JSON.stringify(view.entries)).not.toContain("/compact");
+      expect((await probe("/test/memory/file?path=MEMORY.md")).body).toEqual(memory);
+      await mf.dispose();
+      mf = await runtime("TestAgent", "compact-history");
+      const repeated = await telegram(1, "/compact");
+      expect((await waitJob(repeated.body.id)).compactionTaskId).toBe(job.compactionTaskId);
+      expect(received.length).toBe(before + 1);
+      const reopened = (await probe("/test/context")).body;
+      expect(reopened.context).toEqual(view.context);
+      expect(reopened.entries.filter((entry: { kind: string }) => entry.kind === "pi.compaction")).toHaveLength(1);
+      expect((await probe(`/test/jobs/${job.id}`, "PUT")).status).toBe(200);
+      await mf.dispose();
+      mf = await runtime("TestAgent", "compact-history");
+      const recovered = await telegram(1, "/compact");
+      expect(await waitJob(recovered.body.id)).toMatchObject({ status: "complete", compactionTaskId: job.compactionTaskId, parts: job.parts });
+      expect((await probe("/test/context")).body).toEqual(reopened);
+      expect(received.length).toBe(before + 2);
+      const normal = await telegram(2, "hello");
+      expect((await waitJob(normal.body.id)).status).toBe("complete");
+    } finally { await mf.dispose(); mf = previous; }
+  });
+
+  it("reports failed compaction without deleting history or installing an incomplete summary", async () => {
+    const previous = mf;
+    mf = await runtime("TestAgent", "compact-failure");
+    try {
+      expect((await probe("/test/context", "PUT", compactHistory.map(message => `compaction-failure\n${message}`))).status).toBe(200);
+      const original = (await probe("/test/context")).body;
+      const queued = await telegram(1, "/compact");
+      const job = await waitJob(queued.body.id);
+      expect(job).toMatchObject({ status: "failed", error: "compaction_failed", parts: ["上下文压缩未完成，请稍后重试；历史记录和记忆文件未删除。"] });
+      expect((await probe("/test/context")).body).toEqual(original);
+      const duplicate = await telegram(1, "/compact");
+      expect((await waitJob(duplicate.body.id)).compactionTaskId).toBe(job.compactionTaskId);
+    } finally { await mf.dispose(); mf = previous; }
+  });
+
   it("runs Web Access through Pi Durable without external calls", async () => {
     const before = outbound.length;
-    const queued = await api("/api/chat", "POST", { requestId: "web", text: "读取网页" });
-    expect(queued.status).toBe(202);
+    const queued = await telegram(48, "读取网页");
+    expect(queued.status).toBe(200);
     const job = await waitJob(queued.body.id);
     expect(job.status).toBe("complete");
     expect(job.parts).toEqual(["本地工具执行完成。"]);
     expect(outbound.slice(before)).toContain("example.com");
     expect(outbound.slice(before)).toContain("cloudflare-dns.com");
-    expect((await api("/api/telegram/latest")).body.job.id).toBe(createHash("sha256").update("telegram:42").digest("hex"));
   });
 
   it("preserves state across a runtime restart and does not resend completed jobs", async () => {
@@ -197,12 +242,11 @@ describe.sequential("real local Workers / SQLite Durable Object (no R2 binding)"
     const repeated = await telegram(42, "remember");
     expect((await waitJob(repeated.body.id)).status).toBe("complete");
     expect(received.length).toBe(before);
-    expect((await api("/api/telegram/latest")).body.job.id).toBe(repeated.body.id);
-    expect((await api("/api/memory/file?path=MEMORY.md")).body.content.match(/测试用户喜欢简洁回答/g)).toHaveLength(1);
+    expect((await probe("/test/memory/file?path=MEMORY.md")).body.content.match(/测试用户喜欢简洁回答/g)).toHaveLength(1);
   });
 
   it("retries a known Telegram 429 without re-running the memory tool", async () => {
-    const count = async () => (await api("/api/memory/file?path=MEMORY.md")).body.content.match(/测试用户喜欢简洁回答/g)?.length ?? 0;
+    const count = async () => (await probe("/test/memory/file?path=MEMORY.md")).body.content.match(/测试用户喜欢简洁回答/g)?.length ?? 0;
     const before = await count();
     rejectOnce = true;
     const queued = await telegram(43, "remember");
@@ -232,7 +276,6 @@ describe.sequential("real local Workers / SQLite Durable Object (no R2 binding)"
     expect(voices.at(-1)).toEqual({ chatId: "123", bytes: 512, replyTo: 47 });
     expect(voices.length).toBe(before + 1);
     expect(speechCalls).toBe(generated + 1);
-    expect((await api("/api/telegram/latest")).body.job.speech.messageId).toBe(job.speech.messageId);
     await mf.dispose();
     mf = await runtime();
     const duplicate = await telegram(46, "speak-twice");
@@ -257,24 +300,6 @@ describe.sequential("real local Workers / SQLite Durable Object (no R2 binding)"
     expect(speechCalls).toBe(generated + 1);
   });
 
-  it("starts wakeup reminders and stops them on an actual user confirmation", async () => {
-    const generated = speechCalls;
-    const voiceCount = voices.length;
-    const start = await api("/api/wakeup", "POST", { maxMinutes: 1, intervalSeconds: 60 });
-    expect(start.status).toBe(202);
-    const id = createHash("sha256").update(`wakeup:${start.body.id}:0`).digest("hex");
-    const reminder = await waitJob(id);
-    expect(reminder.status).toBe("complete");
-    expect(reminder.speech).toBeUndefined();
-    expect(received.at(-1)?.text).toContain("起床啦");
-    expect(speechCalls).toBe(generated);
-    expect(voices.length).toBe(voiceCount);
-    expect((await api("/api/wakeup")).body.active).toBe(true);
-    const user = await telegram(45, "我醒了");
-    expect((await waitJob(user.body.id)).status).toBe("complete");
-    expect((await api("/api/wakeup")).body).toMatchObject({ active: false, confirmedAt: expect.any(Number) });
-  });
-
   it("runs the scheduled handler, keeps active wakeups idempotent and accepts owner confirmation", async () => {
     const previous = mf;
     const scheduled = await runtime("TestAgent", "scheduled");
@@ -286,7 +311,7 @@ describe.sequential("real local Workers / SQLite Durable Object (no R2 binding)"
       const generated = speechCalls;
       const voiceCount = voices.length;
       expect((await worker.scheduled(event)).outcome).toBe("ok");
-      const wakeup = (await api("/api/wakeup")).body;
+      const wakeup = (await probe("/test/wakeup")).body;
       expect(wakeup).toMatchObject({ active: true, intervalMs: 120_000 });
       expect(wakeup.deadline - wakeup.startedAt).toBe(360 * 60_000);
       const id = createHash("sha256").update(`wakeup:${wakeup.id}:0`).digest("hex");
@@ -298,11 +323,11 @@ describe.sequential("real local Workers / SQLite Durable Object (no R2 binding)"
       expect(speechCalls).toBe(generated);
       expect(voices.length).toBe(voiceCount);
       expect((await worker.scheduled(event)).outcome).toBe("ok");
-      expect((await api("/api/wakeup")).body.id).toBe(wakeup.id);
+      expect((await probe("/test/wakeup")).body.id).toBe(wakeup.id);
       expect(received.length).toBe(before + 1);
       const owner = await telegram(1001, "我醒了");
       expect((await waitJob(owner.body.id)).status).toBe("complete");
-      expect((await api("/api/wakeup")).body).toMatchObject({ active: false, confirmedAt: expect.any(Number) });
+      expect((await probe("/test/wakeup")).body).toMatchObject({ active: false, confirmedAt: expect.any(Number) });
     } finally { mf = previous; await scheduled.dispose(); }
   });
 
@@ -314,7 +339,7 @@ describe.sequential("real local Workers / SQLite Durable Object (no R2 binding)"
   });
 
   it("processes concurrently admitted distinct jobs without losing the alarm", async () => {
-    const jobs = await Promise.all(Array.from({ length: 4 }, (_, index) => api("/api/chat", "POST", { requestId: `concurrent:${index}`, text: `hello ${index}` })));
+    const jobs = await Promise.all(Array.from({ length: 4 }, (_, index) => telegram(100 + index, `hello ${index}`)));
     expect(new Set(jobs.map((job) => job.body.id)).size).toBe(4);
     const done = await Promise.all(jobs.map((job) => waitJob(job.body.id)));
     expect(done.every((job) => job.status === "complete")).toBe(true);
@@ -322,18 +347,18 @@ describe.sequential("real local Workers / SQLite Durable Object (no R2 binding)"
   });
 
   it("persists and reads nested Skill references through the actual Durable tools", async () => {
-    const queued = await api("/api/chat", "POST", { requestId: "skill", text: "persist-skill" });
+    const queued = await telegram(49, "persist-skill");
     expect((await waitJob(queued.body.id)).status).toBe("complete");
-    expect((await api("/api/memory/file?path=skills/test/nested/references/check.md")).body.content).toBe("持久化技能参考");
+    expect((await probe("/test/memory/file?path=skills/test/nested/references/check.md")).body.content).toBe("持久化技能参考");
   });
 
-  it("runs the unmodified production Agent with the official OpenRouter provider and Workers Secrets", async () => {
+  it("runs the production model runtime with the official OpenRouter provider and Workers Secrets", async () => {
     const fake = mf;
-    const production = await runtime("AgentBackend", "openrouter");
+    const production = await runtime("ProbeAgent", "openrouter");
     mf = production;
     try {
       const before = outbound.length;
-      const queued = await api("/api/chat", "POST", { requestId: "real-provider", text: "只需回答一句话" });
+      const queued = await telegram(1, "只需回答一句话");
       const job = await waitJob(queued.body.id);
       expect(job.status).toBe("complete");
       expect(job.parts).toEqual(["OpenRouter 本地完成。"]);
@@ -341,67 +366,85 @@ describe.sequential("real local Workers / SQLite Durable Object (no R2 binding)"
     } finally { mf = fake; await production.dispose(); }
   });
 
-  it("DO file writes reject stale versions and unsafe paths", async () => {
-    const first = await api("/api/memory/file?path=USER.md", "PUT", { content: "用户原稿", etag: null });
-    const second = await api("/api/memory/file?path=USER.md", "PUT", { content: "用户修正", etag: first.body.etag });
-    expect(second.status).toBe(200);
-    expect((await api("/api/memory/file?path=USER.md", "PUT", { content: "stale", etag: first.body.etag })).status).toBe(412);
-    expect((await api("/api/memory/file?path=..%2FUSER.md")).status).toBe(400);
+  it("runs bash through Pi with shared files, no secrets, and persistence across restart", async () => {
+    const before = (await probe("/test/memory/file?path=MEMORY.md")).body;
+    const calls = outbound.length;
+    const queued = await telegram(50, "bash-files");
+    const job = await waitJob(queued.body.id);
+    expect(job.parts).toEqual(["本地工具执行完成。"]);
+    expect(outbound.slice(calls)).toEqual(["api.telegram.org"]);
+    const memory = (await probe("/test/memory/file?path=MEMORY.md")).body;
+    expect(memory.content).toContain("bash 追加记忆");
+    expect(memory.etag).not.toBe(before.etag);
+    await mf.dispose();
+    mf = await runtime();
+    expect((await probe("/test/memory/file?path=skills/bash/demo/SKILL.md")).body.content).toBe("持久化技能参考");
+    expect((await probe("/test/memory/file?path=MEMORY.md")).body).toEqual(memory);
+    expect((await probe("/test/memory/file?path=MEMORY.md", "PUT", { content: "stale", etag: before.etag })).status).toBe(412);
   });
 
-  it("rejects concurrent API replacements of the same revision", async () => {
-    const endpoint = "/api/memory/file?path=STANDING.md";
-    const first = await api(endpoint, "PUT", { content: "first", etag: null });
-    const responses = await Promise.all(["edit A", "edit B"].map((content) => api(endpoint, "PUT", { content, etag: first.body.etag })));
+  it("migrates only by an authenticated manual call to a temporary Worker, then removes the endpoint", async () => {
+    const previous = mf;
+    mf = await runtime("ProbeAgent", "migration");
+    try {
+      const files = [
+        { path: "MEMORY.md", content: "\ufeff旧中文记忆\n", etag: crypto.randomUUID() },
+        { path: "skills/nested/large/reference.txt", content: "😀\n".repeat(50_000) + "x".repeat(MAX_FILE_BYTES - 250_000), etag: crypto.randomUUID() },
+        { path: "skills/empty/SKILL.md", content: "", etag: crypto.randomUUID() },
+      ];
+      expect((await probe("/test/legacy", "PUT", files)).body.present).toBe(true);
+      await mf.dispose();
+      mf = await runtime("ProbeAgent", "migration");
+      expect((await probe("/test/memory/file?path=MEMORY.md")).body.etag).toBeNull();
+      expect((await probe("/test/legacy")).body.present).toBe(true);
+      await mf.dispose();
+      mf = await runtime("AgentBackend", "migration", migrationBundle);
+      expect((await mf.dispatchFetch("https://agent.invalid/telegram/webhook", { method: "POST" })).status).toBe(503);
+      const endpoint = "https://agent.invalid/migrate-files";
+      expect((await mf.dispatchFetch(endpoint, { method: "POST" })).status).toBe(401);
+      const headers = { "x-telegram-bot-api-secret-token": webhook };
+      expect(await responseJSON(await mf.dispatchFetch(endpoint, { headers }))).toEqual({ legacyFiles: 3, files: 0, verified: 0 });
+      expect(await responseJSON(await mf.dispatchFetch(endpoint, { method: "POST", headers }))).toEqual({ migrated: 3, verified: 3 });
+      expect(await responseJSON(await mf.dispatchFetch(endpoint, { headers }))).toEqual({ legacyFiles: 3, files: 3, verified: 3 });
+      expect((await mf.dispatchFetch(endpoint, { method: "POST", headers })).status).toBe(409);
+      await mf.dispose();
+      mf = await runtime("ProbeAgent", "migration");
+      for (const file of files) expect((await probe(`/test/memory/file?path=${file.path}`)).body).toEqual(file);
+      expect((await probe("/test/legacy")).body.present).toBe(true);
+      expect((await mf.dispatchFetch(endpoint, { method: "POST", headers })).status).toBe(404);
+    } finally { await mf.dispose(); mf = previous; }
+  });
+
+  it("DO file writes reject stale versions and unsafe paths", async () => {
+    const first = await probe("/test/memory/file?path=USER.md", "PUT", { content: "用户原稿", etag: null });
+    const second = await probe("/test/memory/file?path=USER.md", "PUT", { content: "用户修正", etag: first.body.etag });
+    expect(second.status).toBe(200);
+    expect((await probe("/test/memory/file?path=USER.md", "PUT", { content: "stale", etag: first.body.etag })).status).toBe(412);
+    expect((await probe("/test/memory/file?path=..%2FUSER.md")).status).toBe(400);
+  });
+
+  it("rejects concurrent DO file replacements of the same revision", async () => {
+    const endpoint = "/test/memory/file?path=STANDING.md";
+    const first = await probe(endpoint, "PUT", { content: "first", etag: null });
+    const responses = await Promise.all(["edit A", "edit B"].map((content) => probe(endpoint, "PUT", { content, etag: first.body.etag })));
     expect(responses.map((response) => response.status).sort()).toEqual([200, 412]);
     const winner = responses.find((response) => response.status === 200)!;
-    expect((await api(endpoint)).body).toEqual(winner.body);
-    expect((await api(endpoint, "PUT", { content: "no revision" })).status).toBe(412);
+    expect((await probe(endpoint)).body).toEqual(winner.body);
+    expect((await probe(endpoint, "PUT", { content: "no revision" })).status).toBe(412);
   });
 
   it("stores a 256 KiB Unicode Skill and preserves its exact content and revision across restart", async () => {
     const content = "😀\n".repeat(50_000) + "x".repeat(MAX_FILE_BYTES - 250_000);
-    const endpoint = "/api/memory/file?path=skills/large/reference.txt";
-    const saved = await api(endpoint, "PUT", { content, etag: null });
+    const endpoint = "/test/memory/file?path=skills/large/reference.txt";
+    const saved = await probe(endpoint, "PUT", { content, etag: null });
     expect(saved.status).toBe(200);
-    expect((await api(endpoint)).body.content === content).toBe(true);
+    expect((await probe(endpoint)).body.content === content).toBe(true);
     await mf.dispose();
     mf = await runtime();
-    const reread = await api(endpoint);
+    const reread = await probe(endpoint);
     expect(reread.body.etag).toBe(saved.body.etag);
     expect(reread.body.content === content).toBe(true);
-    expect((await api(endpoint, "PUT", { content: content + "x", etag: saved.body.etag })).status).toBe(413);
-    expect((await api(endpoint)).body.etag).toBe(saved.body.etag);
-  });
-
-  it.skipIf(!process.env.HERMES_DEBUG_DIR)("imports the user's real file tree into local DO storage without modifying or logging its contents", async () => {
-    const digest = (value: string) => createHash("sha256").update(value).digest("hex");
-    const files = await collectMemoryFiles(process.env.HERMES_DEBUG_DIR!);
-    expect(files.length).toBeGreaterThan(3);
-    for (const file of files) {
-      const endpoint = `/api/memory/file?path=${encodeURIComponent(file.path)}`;
-      const current = await api(endpoint);
-      const result = await api(endpoint, "PUT", { content: file.content, etag: current.body.etag });
-      expect(result.status).toBe(200);
-      expect(digest(result.body.content)).toBe(digest(file.content));
-    }
-    const list = await api("/api/memory/files");
-    expect(list.body.some((file: { path: string }) => file.path.endsWith("/references/game-bundle-patterns.md"))).toBe(true);
-    await mf.dispose();
-    mf = await runtime();
-    for (const file of files) {
-      const restored = await api(`/api/memory/file?path=${encodeURIComponent(file.path)}`);
-      expect(digest(restored.body.content)).toBe(digest(file.content));
-    }
-    const memory = files.find((file: { path: string }) => file.path === "MEMORY.md")!;
-    const query = memory.content.match(/[\p{L}\p{N}]{4,20}/u)?.[0];
-    expect(Boolean(query)).toBe(true);
-    const namespace = await mf.getDurableObjectNamespace("AGENT");
-    const response = await namespace.get(namespace.idFromName("123")).fetch(`https://agent.internal/test/memory-probe?query=${encodeURIComponent(query!)}`);
-    const probe = await responseJSON(response);
-    expect(probe.skillCount).toBe(files.filter((file: { path: string }) => file.path.endsWith("/SKILL.md")).length);
-    expect(probe.matchedPaths.includes("MEMORY.md")).toBe(true);
-    const reread = await collectMemoryFiles(process.env.HERMES_DEBUG_DIR!);
-    expect(reread.map((file: { path: string; content: string }) => [file.path, digest(file.content)])).toEqual(files.map((file: { path: string; content: string }) => [file.path, digest(file.content)]));
+    expect((await probe(endpoint, "PUT", { content: content + "x", etag: saved.body.etag })).status).toBe(413);
+    expect((await probe(endpoint)).body.etag).toBe(saved.body.etag);
   });
 });

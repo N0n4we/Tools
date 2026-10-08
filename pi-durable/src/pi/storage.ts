@@ -2,8 +2,8 @@ import { SqliteStorage, type SqliteDatabase, type SqliteExecutor, type SqliteVal
 
 // The npm 1.0.4 package has the portable SQLite core but does not yet export
 // the Cloudflare adapter from upstream main. This small host adapter implements
-// that public interface. Hermes texts have their own file table in this same
-// Durable Object; no R2, native Hermes database or filesystem is required.
+// that public interface. Session tables stay separate from the just-bash
+// filesystem in this same Durable Object; no R2 or native database is required.
 type Value = ArrayBuffer | string | number | null;
 
 function bind(value: SqliteValue): Value {

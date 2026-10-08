@@ -32,7 +32,7 @@ export function splitTelegramText(text: string, limit = 4_000): string[] {
 }
 
 export class TelegramError extends Error {
-  constructor(public readonly retryAfter: number, public readonly retryable: boolean, public readonly uncertain: boolean, public readonly errorCode?: number, public readonly reason?: string) {
+  constructor(public readonly retryAfter: number, public readonly retryable: boolean, public readonly uncertain: boolean) {
     super("Telegram delivery failed");
     this.name = "TelegramError";
   }
@@ -57,7 +57,7 @@ export class TelegramBot {
       await response.body?.cancel();
       throw new TelegramError(30, false, false);
     }
-    let json: { ok?: boolean; result?: T; error_code?: number; description?: string; parameters?: { retry_after?: number } };
+    let json: { ok?: boolean; result?: T; parameters?: { retry_after?: number } };
     try {
       const value: unknown = JSON.parse(await readLimited(response, 64 * 1024));
       if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid Telegram response");
@@ -66,14 +66,7 @@ export class TelegramBot {
     catch { throw new TelegramError(30, false, true); }
     if (!response.ok || json.ok !== true) {
       const delay = Number(json.parameters?.retry_after ?? 30);
-      // Never return the raw Telegram description: it can contain request data.
-      const description = typeof json.description === "string" ? json.description.toLowerCase() : "";
-      const reason = method === "setWebhook"
-        ? /resolve host|resolve hostname/.test(description) ? "webhook_dns_failed"
-          : /ssl|certificate|tls/.test(description) ? "webhook_tls_failed"
-          : /webhook/.test(description) ? "webhook_rejected" : "api_rejected"
-        : "api_rejected";
-      throw new TelegramError(Number.isFinite(delay) ? Math.max(1, Math.min(3600, Math.ceil(delay))) : 30, response.status === 429 || response.status >= 500, false, json.error_code ?? response.status, reason);
+      throw new TelegramError(Number.isFinite(delay) ? Math.max(1, Math.min(3600, Math.ceil(delay))) : 30, response.status === 429 || response.status >= 500, false);
     }
     if (json.result === undefined) throw new TelegramError(30, false, true);
     return json.result;
@@ -99,32 +92,5 @@ export class TelegramBot {
     const result = await this.call<{ message_id?: number }>("sendVoice", body, signal);
     if (!Number.isSafeInteger(result?.message_id)) throw new TelegramError(30, false, true);
     return result.message_id!;
-  }
-
-  async status(owner: number) {
-    const bot = await this.call<{ id: number; is_bot: boolean; username?: string }>("getMe");
-    const webhook = await this.call<{ url: string; pending_update_count: number; last_error_date?: number }>("getWebhookInfo");
-    if (!Number.isSafeInteger(bot?.id) || bot.is_bot !== true || typeof webhook?.url !== "string") throw new TelegramError(30, false, true);
-    let ownerChatReady = false;
-    try {
-      const chat = await this.call<{ id: number; type: string }>("getChat", { chat_id: owner });
-      ownerChatReady = chat?.id === owner && chat.type === "private";
-    } catch (error) {
-      // A user who has not started (or has blocked) the bot needs to act first.
-      if (!(error instanceof TelegramError) || ![400, 403].includes(error.errorCode ?? 0)) throw error;
-    }
-    return { bot: { id: bot.id, username: bot.username }, ownerChatReady, webhook: { url: webhook.url, pendingUpdates: webhook.pending_update_count, lastErrorAt: webhook.last_error_date } };
-  }
-
-  async setWebhook(input: string, secret: string): Promise<void> {
-    const url = new URL(input);
-    if (url.protocol !== "https:" || url.username || url.password || (url.port && url.port !== "443") || url.pathname !== "/telegram/webhook" || url.search || url.hash) {
-      throw new HttpError(400, "Expected an HTTPS /telegram/webhook URL");
-    }
-    if (!/^[A-Za-z0-9_-]{16,256}$/.test(secret)) throw new HttpError(503, "Configure a valid TELEGRAM_WEBHOOK_SECRET");
-    const result = await this.call<boolean>("setWebhook", {
-      url: url.href, secret_token: secret, allowed_updates: ["message"], max_connections: 1, drop_pending_updates: false,
-    });
-    if (result !== true) throw new TelegramError(30, false, true);
   }
 }

@@ -3,7 +3,6 @@ TELEGRAM_BOT_TOKEN="replace-with-bot-token"
 TELEGRAM_USER_ID="123456789"
 TELEGRAM_WEBHOOK_SECRET="replace-with-a-random-webhook-secret"
 OPENROUTER_API_KEY="replace-with-openrouter-key"
-AGENT_ADMIN_TOKEN="replace-with-a-random-admin-token-at-least-32-characters"
 # Optional: select the matching WEB_SEARCH_PROVIDER in wrangler.jsonc.
 # BRAVE_SEARCH_API_KEY="..."
 # TAVILY_API_KEY="..."

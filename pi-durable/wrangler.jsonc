@@ -16,7 +16,7 @@
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["AgentBackend"] }
   ],
-  // Cloudflare Cron uses UTC: 22:00 UTC = 06:00 Asia/Shanghai the next day.
-  "triggers": { "crons": ["0 22 * * *"] },
+  // Cloudflare Cron uses UTC: 00:00 UTC = 08:00 Asia/Shanghai the next day.
+  "triggers": { "crons": ["0 0 * * *"] },
   "observability": { "enabled": true }
 }

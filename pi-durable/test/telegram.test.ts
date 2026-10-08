@@ -27,8 +27,8 @@ describe("Telegram", () => {
     expect(body.parse_mode).toBeUndefined();
   });
   it("distinguishes a known rate-limit rejection from uncertain delivery", async () => {
-    const rateLimit = vi.fn(async () => Response.json({ ok: false, parameters: { retry_after: 2 } }, { status: 429 })) as unknown as typeof fetch;
-    await expect(new TelegramBot("test", rateLimit).send(123, "x")).rejects.toMatchObject({ retryable: true, retryAfter: 2, uncertain: false });
+    const rateLimit = vi.fn(async () => Response.json({ ok: false, description: "private-request-data", parameters: { retry_after: 2 } }, { status: 429 })) as unknown as typeof fetch;
+    await expect(new TelegramBot("test", rateLimit).send(123, "x")).rejects.toMatchObject({ retryable: true, retryAfter: 2, uncertain: false, message: "Telegram delivery failed" });
     const network = vi.fn(async () => { throw new Error("do not log credentials"); }) as unknown as typeof fetch;
     await expect(new TelegramBot("test", network).send(123, "x")).rejects.toMatchObject({ uncertain: true, retryable: false, message: "Telegram delivery failed" });
   });
@@ -58,28 +58,5 @@ describe("Telegram", () => {
     await expect(new TelegramBot("test", mock).send(123, "x")).rejects.toMatchObject({ retryable: false, uncertain: false });
     expect(vi.mocked(mock).mock.calls).toHaveLength(1);
     expect(vi.mocked(mock).mock.calls[0]?.[1]?.redirect).toBe("manual");
-  });
-  it("checks bot identity, webhook and owner chat without returning credentials", async () => {
-    const mock = vi.fn(async (url: RequestInfo | URL) => {
-      const method = new URL(String(url)).pathname.split("/").at(-1);
-      return Response.json({ ok: true, result: method === "getMe" ? { id: 789, is_bot: true, username: "test_bot" } : method === "getWebhookInfo" ? { url: "", pending_update_count: 0 } : { id: 123, type: "private" } });
-    }) as unknown as typeof fetch;
-    const status = await new TelegramBot("test-token", mock).status(123);
-    expect(status).toMatchObject({ bot: { username: "test_bot" }, ownerChatReady: true, webhook: { url: "", pendingUpdates: 0 } });
-    expect(JSON.stringify(status)).not.toContain("test-token");
-    expect(vi.mocked(mock).mock.calls).toHaveLength(3);
-  });
-  it("registers a webhook without discarding pending updates or exposing its secret", async () => {
-    const mock = vi.fn(async () => Response.json({ ok: true, result: true })) as unknown as typeof fetch;
-    await new TelegramBot("test-token", mock).setWebhook("https://example.com/telegram/webhook", "test-webhook-secret");
-    const body = JSON.parse(vi.mocked(mock).mock.calls[0]?.[1]?.body as string);
-    expect(body).toEqual({ url: "https://example.com/telegram/webhook", secret_token: "test-webhook-secret", allowed_updates: ["message"], max_connections: 1, drop_pending_updates: false });
-    await expect(new TelegramBot("test-token", mock).setWebhook("http://example.com/telegram/webhook", "test-webhook-secret")).rejects.toMatchObject({ status: 400 });
-    expect(vi.mocked(mock).mock.calls).toHaveLength(1);
-  });
-
-  it("classifies webhook setup failures without exposing the raw Telegram description", async () => {
-    const mock = vi.fn(async () => Response.json({ ok: false, error_code: 400, description: "Bad webhook: failed to resolve host with private-request-data" }, { status: 400 })) as unknown as typeof fetch;
-    await expect(new TelegramBot("test-token", mock).setWebhook("https://example.com/telegram/webhook", "test-webhook-secret")).rejects.toMatchObject({ errorCode: 400, reason: "webhook_dns_failed", message: "Telegram delivery failed" });
   });
 });

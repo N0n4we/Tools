@@ -54,7 +54,7 @@ export function memoryExtension(store: MemoryStore) {
         execute: (args) => result(async () => (await store.skills(args.query)).slice(0, 100)),
       }),
       defineTool({
-        name: "skill_read", description: "按需读取一个 Skill 的 SKILL.md 或同目录的 references 等文本文件。slug 使用 skill_list 返回值（不含 skills/ 前缀），file 为相对路径、默认 SKILL.md。不存在的文件会报错，不代表空文件。没有 shell，不能假装执行本地命令。", replay: "safe",
+        name: "skill_read", description: "按需读取一个 Skill 的 SKILL.md 或同目录的 references 等文本文件。slug 使用 skill_list 返回值（不含 skills/ 前缀），file 为相对路径、默认 SKILL.md。不存在的文件会报错，不代表空文件。可用 bash 仅为虚拟 shell，不能执行真实本地程序。", replay: "safe",
         parameters: Type.Object({ slug: Type.String({ minLength: 1, maxLength: 200 }), file: Type.Optional(Type.String({ maxLength: 200 })) }),
         execute: (args) => result(async () => {
           const file = await store.read(skillPath(args.slug, args.file));

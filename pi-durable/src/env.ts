@@ -6,7 +6,6 @@ export interface Env {
   TELEGRAM_USER_ID: string;
   TELEGRAM_WEBHOOK_SECRET: string;
   OPENROUTER_API_KEY: string;
-  AGENT_ADMIN_TOKEN: string;
   PI_MODEL?: string;
   MEMORY_PREFIX?: string;
   WEB_SEARCH_PROVIDER?: string;
@@ -16,7 +15,7 @@ export interface Env {
   TTS_MODEL?: string;
 }
 
-export function ownerId(env: Env): string {
+export function ownerId(env: Pick<Env, "TELEGRAM_USER_ID">): string {
   const value = env.TELEGRAM_USER_ID;
   if (!/^[1-9][0-9]*$/.test(value ?? "") || !Number.isSafeInteger(Number(value))) {
     throw new Error("TELEGRAM_USER_ID must be a positive safe integer");

@@ -14,6 +14,7 @@ export interface TextFile {
 }
 
 export type MemoryStorage = Pick<DurableObjectStorage, "sql" | "transactionSync">;
+type FileWriter = { writeFile(path: string, content: string): void; mkdir(path: string, options: { recursive: boolean }): void };
 
 export function validatePath(path: string): string {
   if (typeof path !== "string" || path.length > 512 || /[\\\x00-\x1f\x7f]/.test(path)) {
@@ -69,31 +70,32 @@ export function searchText(path: string, content: string, query: string): Search
 export class MemoryStore {
   readonly prefix: string;
 
-  constructor(private readonly storage: MemoryStorage, prefix: string) {
+  constructor(private readonly storage: MemoryStorage, prefix: string, private readonly files: FileWriter) {
     if (!/^[A-Za-z0-9_-]+(?:\/[A-Za-z0-9_-]+)*\/?$/.test(prefix)) {
       throw new Error("MEMORY_PREFIX must contain only safe path segments");
     }
     this.prefix = prefix.endsWith("/") ? prefix : `${prefix}/`;
-    // Keep file paths and exact text independent of Pi's session tables. Using
-    // SQL TEXT avoids the 128 KiB per-value limit of DO's get/put interface.
-    storage.sql.exec(`CREATE TABLE IF NOT EXISTS hermes_text_files (
-      namespace TEXT NOT NULL,
-      path TEXT NOT NULL,
-      content TEXT NOT NULL,
-      etag TEXT NOT NULL,
-      bytes INTEGER NOT NULL,
-      PRIMARY KEY (namespace, path)
-    )`);
+    files.mkdir(`/${this.prefix.slice(0, -1)}`, { recursive: true });
+    for (const event of ["INSERT", "UPDATE OF path, is_dir"]) {
+      storage.sql.exec(`CREATE TRIGGER IF NOT EXISTS "files_count_${event.split(" ")[0]}_${this.prefix}" BEFORE ${event} ON files
+        WHEN NEW.is_dir = 0 AND NEW.path GLOB '/${this.prefix}*'
+        ${event.startsWith("UPDATE") ? `AND (OLD.is_dir != 0 OR OLD.path NOT GLOB '/${this.prefix}*')` : ""}
+        AND (SELECT COUNT(*) FROM files WHERE is_dir = 0 AND path GLOB '/${this.prefix}*') >= ${MAX_FILES}
+        BEGIN SELECT RAISE(ABORT, 'Too many memory files'); END`);
+    }
   }
 
   async read(path: string): Promise<TextFile> {
     validatePath(path);
-    const file = this.storage.sql.exec<{ content: string; etag: string; bytes: number }>(
-      "SELECT content, etag, bytes FROM hermes_text_files WHERE namespace = ? AND path = ?", this.prefix, path,
+    const file = this.storage.sql.exec<{ content: ArrayBuffer | null; etag: string; bytes: number; is_dir: number; symlink_target: string | null }>(
+      "SELECT content, etag, size AS bytes, is_dir, symlink_target FROM files WHERE path = ?", `/${this.prefix}${path}`,
     ).toArray()[0];
     if (!file) return { path, content: "", etag: null };
+    if (file.is_dir || file.symlink_target !== null) throw new HttpError(400, "Memory path must be a regular file");
     if (file.bytes > MAX_FILE_BYTES) throw new HttpError(413, "Memory file is too large");
-    return { path, content: file.content, etag: file.etag };
+    try {
+      return { path, content: new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(file.content ?? undefined), etag: file.etag };
+    } catch { throw new HttpError(400, "Memory file must contain UTF-8 text"); }
   }
 
   async write(path: string, content: string, expectedETag?: string | null): Promise<TextFile> {
@@ -101,12 +103,12 @@ export class MemoryStore {
     if (typeof content !== "string") throw new HttpError(400, "content must be a string");
     const bytes = new TextEncoder().encode(content).byteLength;
     if (bytes > MAX_FILE_BYTES) throw new HttpError(413, "Memory file is too large");
-    // No await between reading the revision and committing the update: both
-    // API writes and model tools use this same DO and atomic transaction.
+    // Keep revision checks and writes atomic so concurrent tools cannot overwrite corrections.
     return this.storage.transactionSync(() => {
-      const previous = this.storage.sql.exec<{ etag: string }>(
-        "SELECT etag FROM hermes_text_files WHERE namespace = ? AND path = ?", this.prefix, path,
+      const previous = this.storage.sql.exec<{ etag: string; is_dir: number; symlink_target: string | null }>(
+        "SELECT etag, is_dir, symlink_target FROM files WHERE path = ?", `/${this.prefix}${path}`,
       ).toArray()[0];
+      if (previous && (previous.is_dir || previous.symlink_target !== null)) throw new HttpError(400, "Memory path must be a regular file");
       if (previous && expectedETag === undefined) {
         throw new HttpError(412, "Read the file and supply its etag before replacing it");
       }
@@ -115,17 +117,12 @@ export class MemoryStore {
       }
       if (!previous) {
         const count = this.storage.sql.exec<{ count: number }>(
-          "SELECT COUNT(*) AS count FROM hermes_text_files WHERE namespace = ?", this.prefix,
+          "SELECT COUNT(*) AS count FROM files WHERE substr(path, 1, ?) = ? AND is_dir = 0", this.prefix.length + 1, `/${this.prefix}`,
         ).toArray()[0]!.count;
         if (count >= MAX_FILES) throw new HttpError(413, "Too many memory files");
       }
-      // An opaque revision, not a content hash: even A -> B -> A invalidates
-      // the old revision and cannot overwrite a correction with a stale read.
-      const etag = crypto.randomUUID();
-      this.storage.sql.exec(`INSERT INTO hermes_text_files (namespace, path, content, etag, bytes)
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(namespace, path) DO UPDATE SET content = excluded.content, etag = excluded.etag, bytes = excluded.bytes`,
-      this.prefix, path, content, etag, bytes);
+      this.files.writeFile(`/${this.prefix}${path}`, content);
+      const etag = this.storage.sql.exec<{ etag: string }>("SELECT etag FROM files WHERE path = ?", `/${this.prefix}${path}`).toArray()[0]!.etag;
       return { path, content, etag };
     });
   }
@@ -139,10 +136,13 @@ export class MemoryStore {
 
   async list(): Promise<{ path: string; etag: string; size: number }[]> {
     const files = this.storage.sql.exec<{ path: string; etag: string; size: number }>(
-      "SELECT path, etag, bytes AS size FROM hermes_text_files WHERE namespace = ? ORDER BY path LIMIT ?", this.prefix, MAX_FILES + 1,
+      "SELECT substr(path, ?) AS path, etag, size FROM files WHERE substr(path, 1, ?) = ? AND is_dir = 0 AND symlink_target IS NULL ORDER BY path LIMIT ?",
+      this.prefix.length + 2, this.prefix.length + 1, `/${this.prefix}`, MAX_FILES + 1,
     ).toArray();
     if (files.length > MAX_FILES) throw new HttpError(413, "Too many memory files");
-    return files.sort((a, b) => a.path.localeCompare(b.path));
+    return files.filter(file => {
+      try { validatePath(file.path); return true; } catch { return false; }
+    }).sort((a, b) => a.path.localeCompare(b.path));
   }
 
   async search(query: string, limit = 6, includeSkills = false): Promise<SearchHit[]> {

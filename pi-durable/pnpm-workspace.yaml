@@ -1,2 +1,8 @@
 minimumReleaseAgeExclude:
   - '@cloudflare/workers-types@5.20261007.1'
+patchedDependencies:
+  '@stablemodels/durable-bash@0.2.0': patches/@stablemodels__durable-bash@0.2.0.patch
+# Type-only peer: validated against the project's Workers v5 types and workerd.
+peerDependencyRules:
+  allowedVersions:
+    '@stablemodels/durable-bash>@cloudflare/workers-types': '^5.0.0'

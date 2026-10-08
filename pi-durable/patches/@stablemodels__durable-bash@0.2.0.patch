@@ -1,0 +1,64 @@
+diff --git a/dist/fs-object.js b/dist/fs-object.js
+index c730c03fb2c9a55fd51a5ec687e65cc1cf23103d..deba7b75eed3409642d81de8551151e609165178 100644
+--- a/dist/fs-object.js
++++ b/dist/fs-object.js
+@@ -94,7 +94,7 @@ export class FsObject extends DurableObject {
+             : content;
+     }
+     bufferToString(buf) {
+-        return buf !== null ? new TextDecoder().decode(buf) : "";
++        return buf !== null ? new TextDecoder("utf-8", { ignoreBOM: true }).decode(buf) : "";
+     }
+     bufferToUint8Array(buf) {
+         return buf !== null ? new Uint8Array(buf) : new Uint8Array(0);
+@@ -237,7 +237,7 @@ export class FsObject extends DurableObject {
+         this.ensureDirRow(path, row);
+         const prefix = this.childPrefix(normalized);
+         const rows = this.sql
+-            .exec("SELECT path FROM files WHERE path != ? AND path LIKE ?", normalized, `${prefix}%`)
++            .exec("SELECT path FROM files WHERE path != ? AND substr(path, 1, length(?)) = ?", normalized, prefix, prefix)
+             .toArray();
+         const names = new Set();
+         for (const r of rows) {
+@@ -253,7 +253,7 @@ export class FsObject extends DurableObject {
+         this.ensureDirRow(path, row);
+         const prefix = this.childPrefix(normalized);
+         const rows = this.sql
+-            .exec("SELECT path, is_dir, symlink_target FROM files WHERE path != ? AND path LIKE ?", normalized, `${prefix}%`)
++            .exec("SELECT path, is_dir, symlink_target FROM files WHERE path != ? AND substr(path, 1, length(?)) = ?", normalized, prefix, prefix)
+             .toArray();
+         const entries = new Map();
+         for (const r of rows) {
+@@ -295,12 +295,12 @@ export class FsObject extends DurableObject {
+         if (row.is_dir) {
+             const prefix = this.childPrefix(normalized);
+             const children = this.sql
+-                .exec("SELECT 1 FROM files WHERE path LIKE ? LIMIT 1", `${prefix}%`)
++                .exec("SELECT 1 FROM files WHERE substr(path, 1, length(?)) = ? LIMIT 1", prefix, prefix)
+                 .toArray();
+             if (children.length > 0) {
+                 if (!opts?.recursive)
+                     throw ENOTEMPTY(path);
+-                this.sql.exec("DELETE FROM files WHERE path LIKE ?", `${prefix}%`);
++                this.sql.exec("DELETE FROM files WHERE substr(path, 1, length(?)) = ?", prefix, prefix);
+             }
+         }
+         this.sql.exec("DELETE FROM files WHERE path = ?", normalized);
+@@ -317,7 +317,7 @@ export class FsObject extends DurableObject {
+                 throw EISDIR(src);
+             const prefix = this.childPrefix(srcNorm);
+             const rows = this.sql
+-                .exec("SELECT * FROM files WHERE path = ? OR path LIKE ?", srcNorm, `${prefix}%`)
++                .exec("SELECT * FROM files WHERE path = ? OR substr(path, 1, length(?)) = ?", srcNorm, prefix, prefix)
+                 .toArray();
+             this.ensureParentDirs(destNorm);
+             for (const r of rows) {
+@@ -354,7 +354,7 @@ export class FsObject extends DurableObject {
+         if (srcRow.is_dir) {
+             const prefix = this.childPrefix(srcNorm);
+             const rows = this.sql
+-                .exec("SELECT path FROM files WHERE path LIKE ?", `${prefix}%`)
++                .exec("SELECT path FROM files WHERE substr(path, 1, length(?)) = ?", prefix, prefix)
+                 .toArray();
+             // All descendants share the same new parent prefix — the directory
+             // entry itself (moved below) covers the intermediate dirs, so no

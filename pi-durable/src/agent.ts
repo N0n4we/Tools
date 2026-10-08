@@ -1,11 +1,12 @@
-import { DurableObject } from "cloudflare:workers";
+import { AgentFiles } from "./bash/files.js";
+import { bashExtension } from "./bash/extension.js";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { AssistantEntry, Harness, createRegistry, defineExtension, defineTool, section } from "@earendil-works/pi-durable";
+import { AssistantEntry, Harness, createRegistry, defineExtension, defineTool, section, type CompactionResult, type TaskId } from "@earendil-works/pi-durable";
 import { Type } from "typebox";
 import type { Env } from "./env.js";
 import { ownerId, requiredSecret } from "./env.js";
 import { HttpError, errorResponse, jsonBody, textField } from "./http.js";
-import { MAX_FILE_BYTES, MemoryStore } from "./memory/store.js";
+import { MemoryStore } from "./memory/store.js";
 import { memoryExtension, toolText } from "./memory/extension.js";
 import { openAgentStorage } from "./pi/storage.js";
 import { openRouterModels, type AgentModels } from "./pi/models.js";
@@ -21,7 +22,7 @@ const CONTEXT = BACKGROUND_CONTEXT;
 export interface Job {
   id: string;
   requestId: string;
-  kind: "user" | "wakeup";
+  kind: "user" | "wakeup" | "compact";
   input: string;
   chatId?: number;
   replyTo?: number;
@@ -35,6 +36,7 @@ export interface Job {
   retryAt?: number;
   error?: string;
   submissionId?: number;
+  compactionTaskId?: TaskId<CompactionResult>;
 }
 
 export interface Wakeup {
@@ -58,7 +60,8 @@ async function jobId(requestId: string): Promise<string> {
 
 const wakeupPrompt = "这是唤醒提醒，不是用户输入。请发送一两行简短中文提醒，措辞自然且不要重复。只有用户明确表现已经清醒时才调用 wakeup_confirm；困倦或含糊回答不能视为确认。";
 
-export class AgentBackend extends DurableObject<Env> {
+export class AgentBackend extends AgentFiles {
+  declare protected env: Env;
   private draining?: Promise<void>;
   private currentJob?: Job;
   private readonly memory: MemoryStore;
@@ -66,7 +69,7 @@ export class AgentBackend extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     const base = env.MEMORY_PREFIX ?? "hermes/";
-    this.memory = new MemoryStore(ctx.storage, `${base.replace(/\/$/, "")}/${ownerId(env)}/`);
+    this.memory = new MemoryStore(ctx.storage, `${base.replace(/\/$/, "")}/${ownerId(env)}/`, this);
   }
 
   protected modelRuntime(): AgentModels { return openRouterModels(this.env); }
@@ -74,29 +77,6 @@ export class AgentBackend extends DurableObject<Env> {
   async fetch(request: Request): Promise<Response> {
     try {
       const url = new URL(request.url);
-      if (url.pathname === "/telegram/latest" && request.method === "GET") {
-        const id = await this.ctx.storage.get<string>("telegram:latest");
-        const job = id ? await this.ctx.storage.get<Job>(`job:${id}`) : undefined;
-        if (!job) return Response.json({ job: null });
-        const speech = await this.ctx.storage.get<SpeechReceipt>(`speech:${job.id}`);
-        // Operator diagnostics intentionally exclude user text and model output.
-        return Response.json({ job: {
-          id: job.id, status: job.status, createdAt: job.createdAt,
-          sentIds: job.sentIds ?? [], ...(job.error ? { error: job.error } : {}),
-          ...(speech ? { speech } : {}),
-        } });
-      }
-      if (url.pathname === "/memory/files" && request.method === "GET") return Response.json(await this.memory.list());
-      if (url.pathname === "/memory/file") {
-        const path = textField(url.searchParams.get("path"), "path", 512);
-        if (request.method === "GET") return Response.json(await this.memory.read(path));
-        if (request.method === "PUT") {
-          const body = await jsonBody(request, MAX_FILE_BYTES * 2);
-          if (typeof body.content !== "string") throw new HttpError(400, "content must be a string");
-          if (body.etag !== undefined && body.etag !== null && typeof body.etag !== "string") throw new HttpError(400, "Invalid etag");
-          return Response.json(await this.memory.write(path, body.content, body.etag as string | null | undefined));
-        }
-      }
       if (url.pathname === "/enqueue" && request.method === "POST") {
         const body = await jsonBody(request);
         const requestId = textField(body.requestId, "requestId", 200);
@@ -105,48 +85,23 @@ export class AgentBackend extends DurableObject<Env> {
         if (chatId !== undefined && chatId !== Number(ownerId(this.env))) throw new HttpError(403, "Invalid chat");
         const replyTo = body.replyTo === undefined ? undefined : Number(body.replyTo);
         if (replyTo !== undefined && (!Number.isSafeInteger(replyTo) || replyTo < 1)) throw new HttpError(400, "Invalid reply message");
-        const job = await this.enqueue({ requestId, input, kind: "user", chatId, replyTo });
+        const job = await this.enqueue({ requestId, input, kind: input.trim() === "/compact" ? "compact" : "user", chatId, replyTo });
         this.ctx.waitUntil(this.drain());
         return Response.json({ id: job.id, status: job.status }, { status: 202 });
       }
-      if (url.pathname.startsWith("/jobs/") && request.method === "GET") {
-        const id = url.pathname.slice("/jobs/".length);
-        if (!/^[a-f0-9]{64}$/.test(id)) throw new HttpError(400, "Invalid job ID");
-        const job = await this.ctx.storage.get<Job>(`job:${id}`);
-        if (!job) throw new HttpError(404, "Job not found");
-        const speech = await this.ctx.storage.get<SpeechReceipt>(`speech:${job.id}`);
-        return Response.json({ ...job, ...(speech ? { speech } : {}) });
-      }
-      if (url.pathname === "/wakeup") {
-        if (request.method === "GET") return Response.json(await this.ctx.storage.get<Wakeup>("wakeup") ?? { active: false });
-        if (request.method === "DELETE") {
-          await this.ctx.storage.transaction(async (storage) => {
-            const wakeup = await storage.get<Wakeup>("wakeup");
-            if (wakeup) { wakeup.active = false; await storage.put("wakeup", wakeup); }
-          });
-          await this.schedule();
-          return Response.json({ active: false });
-        }
-        if (request.method === "POST") {
-          const body = await jsonBody(request);
-          const minutes = body.maxMinutes === undefined ? 360 : Number(body.maxMinutes);
-          const interval = body.intervalSeconds === undefined ? 120 : Number(body.intervalSeconds);
-          if (!Number.isFinite(minutes) || minutes < 1 || minutes > 360 || !Number.isFinite(interval) || interval < 60 || interval > 3600) {
-            throw new HttpError(400, "Invalid wakeup interval or duration");
-          }
-          const now = Date.now();
-          const wakeup: Wakeup = { id: crypto.randomUUID(), active: true, startedAt: now, deadline: now + minutes * 60_000, nextAt: now, intervalMs: interval * 1000, sequence: 0, startedSequence: 0 };
-          const accepted = await this.ctx.storage.transaction(async (storage) => {
-            const existing = await storage.get<Wakeup>("wakeup");
-            if (existing?.active && existing.deadline > now) return existing;
-            wakeup.startedSequence = (await storage.get<number>("sequence")) ?? 0;
-            await storage.put("wakeup", wakeup);
-            await storage.setAlarm(now);
-            return wakeup;
-          });
-          this.ctx.waitUntil(this.drain());
-          return Response.json(accepted, { status: 202 });
-        }
+      if (url.pathname === "/wakeup" && request.method === "POST") {
+        const now = Date.now();
+        const wakeup: Wakeup = { id: crypto.randomUUID(), active: true, startedAt: now, deadline: now + 360 * 60_000, nextAt: now, intervalMs: 120_000, sequence: 0, startedSequence: 0 };
+        const accepted = await this.ctx.storage.transaction(async (storage) => {
+          const existing = await storage.get<Wakeup>("wakeup");
+          if (existing?.active && existing.deadline > now) return existing;
+          wakeup.startedSequence = (await storage.get<number>("sequence")) ?? 0;
+          await storage.put("wakeup", wakeup);
+          await storage.setAlarm(now);
+          return wakeup;
+        });
+        this.ctx.waitUntil(this.drain());
+        return Response.json(accepted, { status: 202 });
       }
       throw new HttpError(404, "Not found");
     } catch (error) { return errorResponse(error); }
@@ -170,8 +125,7 @@ export class AgentBackend extends DurableObject<Env> {
       const sequence = ((await storage.get<number>("sequence")) ?? 0) + 1;
       const job: Job = { ...input, id, sequence, createdAt: Date.now(), status: "pending", nextPart: 0, deliveryAttempts: 0 };
       await storage.put({ [`job:${id}`]: job, [this.pendingKey(sequence)]: id, sequence });
-      if (input.requestId.startsWith("telegram:")) await storage.put("telegram:latest", id);
-      if (input.kind === "user") {
+      if (input.kind !== "wakeup") {
         const wakeup = await storage.get<Wakeup>("wakeup");
         if (wakeup?.active) { wakeup.lastUserAt = Date.now(); wakeup.lastUserSequence = sequence; wakeup.nextAt = wakeup.lastUserAt + wakeup.intervalMs; await storage.put("wakeup", wakeup); }
       }
@@ -182,6 +136,7 @@ export class AgentBackend extends DurableObject<Env> {
   private registry(store: MemoryStore, job: Job) {
     const registry = createRegistry();
     registry.install(memoryExtension(store));
+    registry.install(bashExtension(this, `/${store.prefix.slice(0, -1)}`));
     registry.install(webExtension(new WebAccess(this.env)));
     // Scheduled reminders do not load speech tools or their prompt section.
     if (job.kind === "user") {
@@ -198,7 +153,7 @@ export class AgentBackend extends DurableObject<Env> {
     registry.install(defineExtension({
       name: "telegram-agent",
       sections: [
-        section("identity", () => "你是用户的私人中文助手，运行在 Cloudflare Workers。使用长期文本记忆与持久化 Skills、公开网页工具帮助用户。读取相关 Skill 后再使用可用工具；本环境没有真实 shell、Node 子进程、ffmpeg 或本地文件系统。不能执行的步骤要如实说明。优先简洁回答；每个请求尽量不超过 8 次工具调用。最终回答会自动发送到 Telegram，不要重复发送。不要披露或尝试读取部署密钥。只记录用户明确确认且值得长期保留的事实，重要纠正应更新记忆。"),
+        section("identity", () => "你是用户的私人中文助手，运行在 Cloudflare Workers。使用长期文本记忆与持久化 Skills、虚拟 bash、公开网页工具帮助用户。读取相关 Skill 后再使用可用工具；本环境没有真实 shell、Node 子进程、ffmpeg 或宿主文件系统。不能执行的步骤要如实说明。优先简洁回答；每个请求尽量不超过 8 次工具调用。最终回答会自动发送到 Telegram，不要重复发送。不要披露或尝试读取部署密钥。只记录用户明确确认且值得长期保留的事实，重要纠正应更新记忆。"),
         section("wakeup_status", async () => {
           const wakeup = await this.ctx.storage.get<Wakeup>("wakeup");
           return wakeup?.active ? "当前正在唤醒用户。含糊、困倦或没有明确表示清醒的回答不能确认；用户确实清醒后调用 wakeup_confirm，再正常回应。" : undefined;
@@ -234,19 +189,35 @@ export class AgentBackend extends DurableObject<Env> {
     try {
       root = await harness.root(CONTEXT, { agent: { model } });
       await root.configure({ model }, CONTEXT);
-      const submission = await root.submit({ type: "input", content: job.input, requestId: job.requestId }, CONTEXT);
-      job.submissionId = submission.id;
-      await this.ctx.storage.put(`job:${job.id}`, job);
-      const settled = await Promise.race([
-        submission.wait(CONTEXT),
+      const reply = await Promise.race([
+        (async () => {
+          if (job.kind === "compact") {
+            if (job.compactionTaskId === undefined) {
+              // ponytail: a crash between task creation and saving its ID can repeat summarization.
+              job.compactionTaskId = await root.compact(undefined, CONTEXT);
+              await this.ctx.storage.put(`job:${job.id}`, job);
+            }
+            const { outcome } = (await harness.waitForTask(job.compactionTaskId, CONTEXT)).state;
+            if (outcome.status !== "completed") throw new Error("Compaction did not complete");
+            if (outcome.result.submissionId === undefined) return "当前上下文较短，无需压缩。";
+            const placement = await harness.submission(outcome.result.submissionId, CONTEXT);
+            if (!placement || (await placement.wait(CONTEXT)).status !== "done") throw new Error("Compaction summary was not placed");
+            return "上下文已压缩，历史记录和记忆文件已保留。";
+          }
+          const submission = await root.submit({ type: "input", content: job.input, requestId: job.requestId }, CONTEXT);
+          job.submissionId = submission.id;
+          await this.ctx.storage.put(`job:${job.id}`, job);
+          const settled = await submission.wait(CONTEXT);
+          if (settled.status !== "done" || settled.type !== "input") throw new Error("Agent submission was not answered");
+          const entry = await root.commit((tx) => tx.entry(AssistantEntry, settled.answer), CONTEXT);
+          const text = entry?.model?.flatMap((message) => message.role === "assistant" ? message.content.flatMap((block) => block.type === "text" ? [block.text] : []) : []).join("\n").trim();
+          return text || "已处理。";
+        })(),
         new Promise<never>((_, reject) => { timeout = setTimeout(() => reject(new Error("Agent job timed out")), JOB_TIMEOUT_MS); }),
       ]);
-      if (settled.status !== "done" || settled.type !== "input") throw new Error("Agent submission was not answered");
-      const entry = await root.commit((tx) => tx.entry(AssistantEntry, settled.answer), CONTEXT);
-      const text = entry?.model?.flatMap((message) => message.role === "assistant" ? message.content.flatMap((block) => block.type === "text" ? [block.text] : []) : []).join("\n").trim();
-      let reply = (text || "已处理。").slice(0, 20_000);
-      if (/[\uD800-\uDBFF]$/.test(reply)) reply = reply.slice(0, -1);
-      job.parts = splitTelegramText(reply);
+      let truncated = reply.slice(0, 20_000);
+      if (/[\uD800-\uDBFF]$/.test(truncated)) truncated = truncated.slice(0, -1);
+      job.parts = splitTelegramText(truncated);
       job.status = "ready";
       await this.ctx.storage.put(`job:${job.id}`, job);
     } catch (error) {
@@ -284,8 +255,8 @@ export class AgentBackend extends DurableObject<Env> {
         await this.ctx.storage.put(`job:${job.id}`, job);
         try { await this.answer(job); }
         catch {
-          job.error = "agent_generation_failed";
-          job.parts = ["这次处理失败了，可能是模型配置、网络或执行超时。请稍后重试；已保存的记忆不会丢失。"];
+          job.error = job.kind === "compact" ? "compaction_failed" : "agent_generation_failed";
+          job.parts = [job.kind === "compact" ? "上下文压缩未完成，请稍后重试；历史记录和记忆文件未删除。" : "这次处理失败了，可能是模型配置、网络或执行超时。请稍后重试；已保存的记忆不会丢失。"];
           job.status = "ready";
           await this.ctx.storage.put(`job:${job.id}`, job);
         }

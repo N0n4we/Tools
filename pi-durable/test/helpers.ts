@@ -1,6 +1,11 @@
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
-import { afterEach } from "vitest";
+import { afterEach, vi } from "vitest";
 import type { MemoryStorage } from "../src/memory/store.js";
+import { AgentFiles } from "../src/bash/files.js";
+
+vi.mock("cloudflare:workers", () => ({ DurableObject: class {
+  constructor(protected ctx: DurableObjectState, protected env: Record<string, unknown>) {}
+} }));
 
 const databases: DatabaseSync[] = [];
 afterEach(() => { for (const database of databases.splice(0)) database.close(); });
@@ -15,7 +20,7 @@ export function memoryDatabase() {
     sql: {
       exec(sql: string, ...values: SQLInputValue[]) {
         const rows = database.prepare(sql).all(...values);
-        return { toArray: () => rows };
+        return { toArray: () => rows, [Symbol.iterator]: () => rows[Symbol.iterator]() };
       },
     },
     transactionSync<T>(callback: () => T): T {
@@ -31,5 +36,7 @@ export function memoryDatabase() {
       }
     },
   };
-  return { storage: storage as unknown as MemoryStorage, database };
+  const durableStorage = storage as unknown as MemoryStorage;
+  const files = new AgentFiles({ storage: durableStorage } as DurableObjectState, {});
+  return { storage: durableStorage, database, files };
 }
