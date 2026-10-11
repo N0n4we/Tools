@@ -76,6 +76,12 @@ export class TestAgent extends ProbeAgent {
         return fauxAssistantMessage("测试压缩摘要：保留重要事实和未完成任务。");
       }
       if (input.includes("这是唤醒")) {
+        const sections = getCurrentSystemMessage(context.messages)?.sections;
+        const time = sections?.current_time?.match(/(\d{4})\/(\d{1,2})\/(\d{1,2}) (\d{2}:\d{2}:\d{2})/);
+        if (!sections?.current_time?.includes("Asia/Shanghai，UTC+8") || !time) throw new Error("Missing Beijing time in the model prompt");
+        const timestamp = Date.parse(`${time[1]}-${time[2]!.padStart(2, "0")}-${time[3]!.padStart(2, "0")}T${time[4]}+08:00`);
+        if (!Number.isFinite(timestamp) || Math.abs(Date.now() - timestamp) > 120_000) throw new Error("Model time is stale or not UTC+8");
+        if (!input.includes("起床") || !input.includes("不要改成睡觉") || !sections?.wakeup_status?.includes("不要改成睡觉")) throw new Error("Wakeup intent is ambiguous");
         if (getCurrentTools(context.messages).some(tool => tool.name === "telegram_speak")) throw new Error("Wakeup still offers the speech tool");
         if (getCurrentSystemMessage(context.messages)?.sections?.telegram_speech !== undefined) throw new Error("Wakeup still includes the speech prompt section");
       }

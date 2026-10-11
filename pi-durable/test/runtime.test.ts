@@ -300,13 +300,14 @@ describe.sequential("real local Workers / SQLite Durable Object (no R2 binding)"
     expect(speechCalls).toBe(generated + 1);
   });
 
-  it("runs the scheduled handler, keeps active wakeups idempotent and accepts owner confirmation", async () => {
+  it("gives scheduled wakeups Beijing time and explicit wake-up intent, stays idempotent and accepts owner confirmation", async () => {
     const previous = mf;
     const scheduled = await runtime("TestAgent", "scheduled");
     mf = scheduled;
     try {
       const worker = await scheduled.getWorker();
-      const event = { cron: "0 22 * * *", scheduledTime: new Date("2026-10-07T22:00:00Z") };
+      const event = { cron: "0 0 * * *", scheduledTime: new Date("2026-10-08T00:00:00Z") };
+      await probe("/test/context", "PUT", ["夜深了，提醒我早点睡觉。"]);
       const before = received.length;
       const generated = speechCalls;
       const voiceCount = voices.length;

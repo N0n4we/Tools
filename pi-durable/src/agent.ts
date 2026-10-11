@@ -58,7 +58,7 @@ async function jobId(requestId: string): Promise<string> {
   return Array.from(new Uint8Array(hash), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
-const wakeupPrompt = "这是唤醒提醒，不是用户输入。请发送一两行简短中文提醒，措辞自然且不要重复。只有用户明确表现已经清醒时才调用 wakeup_confirm；困倦或含糊回答不能视为确认。";
+const wakeupPrompt = "这是唤醒起床提醒，不是用户输入。请发送一两行简短中文提醒，让用户醒来并起床，措辞自然且不要重复。无论当前时间或历史对话内容如何，都不要改成睡觉、晚安或继续休息的提醒。只有用户明确表现已经清醒时才调用 wakeup_confirm；困倦或含糊回答不能视为确认。";
 
 export class AgentBackend extends AgentFiles {
   declare protected env: Env;
@@ -135,6 +135,7 @@ export class AgentBackend extends AgentFiles {
 
   private registry(store: MemoryStore, job: Job) {
     const registry = createRegistry();
+    const currentTime = new Date().toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false });
     registry.install(memoryExtension(store));
     registry.install(bashExtension(this, `/${store.prefix.slice(0, -1)}`));
     registry.install(webExtension(new WebAccess(this.env)));
@@ -154,9 +155,10 @@ export class AgentBackend extends AgentFiles {
       name: "telegram-agent",
       sections: [
         section("identity", () => "你是用户的私人中文助手，运行在 Cloudflare Workers。使用长期文本记忆与持久化 Skills、虚拟 bash、公开网页工具帮助用户。读取相关 Skill 后再使用可用工具；本环境没有真实 shell、Node 子进程、ffmpeg 或宿主文件系统。不能执行的步骤要如实说明。优先简洁回答；每个请求尽量不超过 8 次工具调用。最终回答会自动发送到 Telegram，不要重复发送。不要披露或尝试读取部署密钥。只记录用户明确确认且值得长期保留的事实，重要纠正应更新记忆。"),
+        section("current_time", () => `本轮任务开始时的北京时间（Asia/Shanghai，UTC+8）：${currentTime}。用户时间默认按北京时间理解；运行环境和 bash date 的 UTC 时间不能直接当作用户本地时间。`),
         section("wakeup_status", async () => {
           const wakeup = await this.ctx.storage.get<Wakeup>("wakeup");
-          return wakeup?.active ? "当前正在唤醒用户。含糊、困倦或没有明确表示清醒的回答不能确认；用户确实清醒后调用 wakeup_confirm，再正常回应。" : undefined;
+          return wakeup?.active ? "当前正在唤醒用户起床，不是在提醒睡觉。定时提醒无论时间或历史对话如何，都不要改成睡觉、晚安或继续休息的提醒。含糊、困倦或没有明确表示清醒的回答不能确认；用户确实清醒后调用 wakeup_confirm，再正常回应。" : undefined;
         }),
       ],
       tools: [defineTool({
