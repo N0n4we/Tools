@@ -35,16 +35,3 @@ Telegram webhook
 
 文件工具为 `memory_read/search/append/replace`、`skill_list/read/save`，虚拟 shell 工具为 `bash({command, timeout?})`，网页工具为 `web_search/fetch`，另有 `wakeup_confirm`、`telegram_speak`。
 
-## 文件迁移与验证
-
-正式代码没有旧文件检测或自动迁移。线上旧文件需要显式执行一次手动迁移：
-
-1. 临时部署：`pnpm exec wrangler deploy scripts/migrate-files.worker.ts --keep-vars --durable-objects-code-update-mode immediate`。该临时版本暂停 Telegram 请求（503，等待重试）、Cron 和队列处理，Alarm 延后执行，避免迁移期间并发写入。
-2. 使用与线上一致的 `TELEGRAM_WEBHOOK_SECRET`，先运行 `pnpm files:migrate --url https://WORKER/migrate-files` 查看文件计数；再加 `--confirm` 执行迁移。可用 `node --env-file=.dev.vars scripts/migrate-files.mjs ...` 从本地文件加载密钥，不将密钥写入命令行。迁移在同一同步事务内复制全部路径、文本和 ETag，并校验内容；冲突或校验失败则完整回滚。旧表保留为回退副本，不覆盖已有文件。
-3. 再查看状态，确认 `verified` 等于 `legacyFiles`；然后执行 `pnpm exec wrangler deploy --keep-vars --durable-objects-code-update-mode immediate` 恢复正式服务并移除迁移入口。无论迁移是否成功，都不要让临时维护版本长期留在线上；失败时应恢复迁移前版本，而不是启动尚未迁移的新版。
-
-迁移脚本只在 `scripts/` 中，不进入正式 Worker。Pi 会话、队列、Alarm 和发送回执仍保存在独立数据库表/KV 中，不暴露给 shell。手动迁移和部署均会修改线上资源，须显式授权；未迁移旧文件就部署正式新版会导致旧文件不可见。
-
-固定 `durable-bash` 0.2.0 和 just-bash 1.5.4；pnpm 补丁修正目录路径的 SQL 通配符误匹配，并保留 UTF-8 BOM。升级依赖时需检查文件表、触发器和补丁兼容性。
-
-本地验证：`pnpm check`、`pnpm test`、`pnpm build`（仅 dry-run，不部署）。
