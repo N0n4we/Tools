@@ -1,3 +1,7 @@
+# Workers cannot load these optional native compression addons.
+allowBuilds:
+  '@mongodb-js/zstd': false
+  node-liblzma: false
 minimumReleaseAgeExclude:
   - '@cloudflare/workers-types@5.20261007.1'
 patchedDependencies:
@@ -6,3 +10,5 @@ patchedDependencies:
 peerDependencyRules:
   allowedVersions:
     '@stablemodels/durable-bash>@cloudflare/workers-types': '^5.0.0'
+    # DurableFs is patched and tested against this just-bash release.
+    '@stablemodels/durable-bash>just-bash': '3.6.0'

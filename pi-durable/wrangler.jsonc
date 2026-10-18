@@ -6,9 +6,9 @@
   "compatibility_flags": ["nodejs_compat"],
   "workers_dev": true,
   "vars": {
-    "PI_MODEL": "xiaomi/mimo-v2.6-flash",
+    "PI_MODEL": "deepseek/deepseek-v4.1-flash-1017",
     "MEMORY_PREFIX": "hermes/",
-    "WEB_SEARCH_PROVIDER": "brave"
+    "WEB_SEARCH_PROVIDER": "exa"
   },
   "durable_objects": {
     "bindings": [{ "name": "AGENT", "class_name": "AgentBackend" }]

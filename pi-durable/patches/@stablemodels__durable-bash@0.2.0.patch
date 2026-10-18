@@ -1,7 +1,78 @@
+diff --git a/dist/durable-fs.d.ts b/dist/durable-fs.d.ts
+index b708e28158a663bf02b32c248f1721828ee41a42..e334a2e30397e3c1905009fd9cbccdfa0a620374 100644
+--- a/dist/durable-fs.d.ts
++++ b/dist/durable-fs.d.ts
+@@ -70,6 +70,7 @@ export declare class DurableFs {
+ }
+ /** FsStat shape matching the just-bash IFileSystem interface */
+ export interface FsStat {
++    identity?: string;
+     isFile: boolean;
+     isDirectory: boolean;
+     isSymbolicLink: boolean;
+diff --git a/dist/durable-fs.js b/dist/durable-fs.js
+index 337fef9ede7d756989408839fd3e301d08ae07dc..b658e88cc40f7f65d6980d8c344753f4522efad9 100644
+--- a/dist/durable-fs.js
++++ b/dist/durable-fs.js
+@@ -1,3 +1,4 @@
++import { Buffer } from "node:buffer";
+ import { normalizePath } from "./utils.js";
+ /**
+  * IFileSystem implementation backed by a Durable Object.
+@@ -36,22 +37,25 @@ export class DurableFs {
+         const paths = await this.stub.getAllPaths();
+         this._cachedPaths = new Set(paths);
+     }
+-    async readFile(path, _options) {
+-        const result = await this.stub.readFile(this.resolve(path));
+-        return result.content;
++    async readFile(path, options) {
++        const result = await this.stub.readFileBuffer(this.resolve(path));
++        const encoding = typeof options === "string" ? options : options?.encoding;
++        return Buffer.from(result.content).toString(encoding ?? "utf8");
+     }
+     async readFileBuffer(path) {
+         const result = await this.stub.readFileBuffer(this.resolve(path));
+         return result.content;
+     }
+-    async writeFile(path, content, _options) {
++    async writeFile(path, content, options) {
+         const resolved = this.resolve(path);
+-        await this.stub.writeFile(resolved, content);
++        const encoding = typeof options === "string" ? options : options?.encoding;
++        await this.stub.writeFile(resolved, typeof content === "string" ? Buffer.from(content, encoding) : content);
+         this.addToCache(resolved);
+     }
+-    async appendFile(path, content, _options) {
++    async appendFile(path, content, options) {
+         const resolved = this.resolve(path);
+-        await this.stub.appendFile(resolved, content);
++        const encoding = typeof options === "string" ? options : options?.encoding;
++        await this.stub.appendFile(resolved, typeof content === "string" ? Buffer.from(content, encoding) : content);
+         this.addToCache(resolved);
+     }
+     async exists(path) {
+@@ -167,6 +171,7 @@ function toFsStat(data) {
+         isFile: !data.isDir && !data.isSymlink,
+         isDirectory: data.isDir,
+         isSymbolicLink: data.isSymlink,
++        identity: data.identity,
+         mode: data.mode,
+         size: data.size,
+         mtime: new Date(data.mtimeMs),
 diff --git a/dist/fs-object.js b/dist/fs-object.js
-index c730c03fb2c9a55fd51a5ec687e65cc1cf23103d..deba7b75eed3409642d81de8551151e609165178 100644
+index c730c03fb2c9a55fd51a5ec687e65cc1cf23103d..f8f822d05064dc91ecef5b984b1f0689fd5e1171 100644
 --- a/dist/fs-object.js
 +++ b/dist/fs-object.js
+@@ -46,7 +46,7 @@ export class FsObject extends DurableObject {
+     // ── Private helpers ──────────────────────────────────────────────
+     getRow(path) {
+         const rows = this.sql
+-            .exec("SELECT * FROM files WHERE path = ?", path)
++            .exec("SELECT rowid AS inode, * FROM files WHERE path = ?", path)
+             .toArray();
+         if (rows.length === 0)
+             return null;
 @@ -94,7 +94,7 @@ export class FsObject extends DurableObject {
              : content;
      }
@@ -11,7 +82,32 @@ index c730c03fb2c9a55fd51a5ec687e65cc1cf23103d..deba7b75eed3409642d81de8551151e6
      }
      bufferToUint8Array(buf) {
          return buf !== null ? new Uint8Array(buf) : new Uint8Array(0);
-@@ -237,7 +237,7 @@ export class FsObject extends DurableObject {
+@@ -174,6 +174,8 @@ export class FsObject extends DurableObject {
+         else {
+             if (row.is_dir)
+                 throw EISDIR(path);
++            if (appendBytes.byteLength === 0)
++                return;
+             const existing = this.bufferToUint8Array(row.content);
+             const combined = new Uint8Array(existing.byteLength + appendBytes.byteLength);
+             combined.set(existing, 0);
+@@ -192,6 +194,7 @@ export class FsObject extends DurableObject {
+         return {
+             isDir: row.is_dir === 1,
+             isSymlink: false,
++            identity: String(row.inode),
+             size: row.size,
+             mode: row.mode,
+             mtimeMs: row.mtime_ms,
+@@ -205,6 +208,7 @@ export class FsObject extends DurableObject {
+         return {
+             isDir: row.is_dir === 1,
+             isSymlink: row.symlink_target !== null,
++            identity: String(row.inode),
+             size: row.size,
+             mode: row.mode,
+             mtimeMs: row.mtime_ms,
+@@ -237,7 +241,7 @@ export class FsObject extends DurableObject {
          this.ensureDirRow(path, row);
          const prefix = this.childPrefix(normalized);
          const rows = this.sql
@@ -20,7 +116,7 @@ index c730c03fb2c9a55fd51a5ec687e65cc1cf23103d..deba7b75eed3409642d81de8551151e6
              .toArray();
          const names = new Set();
          for (const r of rows) {
-@@ -253,7 +253,7 @@ export class FsObject extends DurableObject {
+@@ -253,7 +257,7 @@ export class FsObject extends DurableObject {
          this.ensureDirRow(path, row);
          const prefix = this.childPrefix(normalized);
          const rows = this.sql
@@ -29,7 +125,7 @@ index c730c03fb2c9a55fd51a5ec687e65cc1cf23103d..deba7b75eed3409642d81de8551151e6
              .toArray();
          const entries = new Map();
          for (const r of rows) {
-@@ -295,12 +295,12 @@ export class FsObject extends DurableObject {
+@@ -295,12 +299,12 @@ export class FsObject extends DurableObject {
          if (row.is_dir) {
              const prefix = this.childPrefix(normalized);
              const children = this.sql
@@ -44,7 +140,7 @@ index c730c03fb2c9a55fd51a5ec687e65cc1cf23103d..deba7b75eed3409642d81de8551151e6
              }
          }
          this.sql.exec("DELETE FROM files WHERE path = ?", normalized);
-@@ -317,7 +317,7 @@ export class FsObject extends DurableObject {
+@@ -317,7 +321,7 @@ export class FsObject extends DurableObject {
                  throw EISDIR(src);
              const prefix = this.childPrefix(srcNorm);
              const rows = this.sql
@@ -53,7 +149,7 @@ index c730c03fb2c9a55fd51a5ec687e65cc1cf23103d..deba7b75eed3409642d81de8551151e6
                  .toArray();
              this.ensureParentDirs(destNorm);
              for (const r of rows) {
-@@ -354,7 +354,7 @@ export class FsObject extends DurableObject {
+@@ -354,7 +358,7 @@ export class FsObject extends DurableObject {
          if (srcRow.is_dir) {
              const prefix = this.childPrefix(srcNorm);
              const rows = this.sql
@@ -62,3 +158,14 @@ index c730c03fb2c9a55fd51a5ec687e65cc1cf23103d..deba7b75eed3409642d81de8551151e6
                  .toArray();
              // All descendants share the same new parent prefix — the directory
              // entry itself (moved below) covers the intermediate dirs, so no
+diff --git a/dist/types.d.ts b/dist/types.d.ts
+index 81979476a666ae709967f3ebb3f97fa2f77bd80c..5c23f4404ce5d86b89f1e4f3d12710014289523f 100644
+--- a/dist/types.d.ts
++++ b/dist/types.d.ts
+@@ -1,5 +1,6 @@
+ /** Wire format for stat results (serializable over RPC) */
+ export interface FsStatData {
++    identity?: string;
+     isDir: boolean;
+     isSymlink: boolean;
+     size: number;

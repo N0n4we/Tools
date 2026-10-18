@@ -3,7 +3,9 @@ TELEGRAM_BOT_TOKEN="replace-with-bot-token"
 TELEGRAM_USER_ID="123456789"
 TELEGRAM_WEBHOOK_SECRET="replace-with-a-random-webhook-secret"
 OPENROUTER_API_KEY="replace-with-openrouter-key"
-# Optional: select the matching WEB_SEARCH_PROVIDER in wrangler.jsonc.
+# web_search uses Exa by default in wrangler.jsonc.
+EXA_API_KEY="replace-with-exa-key"
+# Optional alternatives: select the matching WEB_SEARCH_PROVIDER in wrangler.jsonc.
 # BRAVE_SEARCH_API_KEY="..."
 # TAVILY_API_KEY="..."
 # Optional non-secret TTS model (default shown; production uses wrangler vars).

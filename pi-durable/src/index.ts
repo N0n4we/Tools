@@ -45,11 +45,14 @@ const worker: ExportedHandler<Env> = {
     response.headers.set("x-content-type-options", "nosniff");
     return response;
   },
-  async scheduled(_event, env, ctx) {
+  async scheduled(event, env, ctx) {
     // Cron is opt-in in wrangler.jsonc; Cloudflare cron expressions are UTC.
     ctx.waitUntil((async () => {
-      const response = await agent(env).fetch(internalRequest("/wakeup"));
-      if (!response.ok) throw new Error("Scheduled wakeup admission failed");
+      const response = await agent(env).fetch(internalRequest("/enqueue", {
+        requestId: `cron:${event.cron}:${event.scheduledTime}`, kind: "scheduled", chatId: Number(ownerId(env)),
+        input: "这是唤醒起床任务，不是用户输入。在调用工具的同一条 assistant 消息中先写一两行给用户的简短中文起床提醒正文，再调用 bash 执行 sleep 120s 等待；assistant 的正文会自动发送到 Telegram，不需要发消息工具，不要用 bash 输出代替正文。每次等待结束后检查本对话的新用户回复，仅在用户明确表示已经清醒时停止，否则继续写提醒正文并调用 sleep 等待，最长持续 6 小时。困倦或含糊回答不能视为清醒。无论当前时间或历史对话内容如何，都不要改成睡觉、晚安或继续休息的提醒。不要自动生成语音。",
+      }));
+      if (!response.ok) throw new Error("Scheduled task admission failed");
     })());
   },
 };

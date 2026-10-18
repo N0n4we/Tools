@@ -9,6 +9,7 @@ export interface Env {
   PI_MODEL?: string;
   MEMORY_PREFIX?: string;
   WEB_SEARCH_PROVIDER?: string;
+  EXA_API_KEY?: string;
   BRAVE_SEARCH_API_KEY?: string;
   TAVILY_API_KEY?: string;
   WEB_ALLOWED_HOSTS?: string;

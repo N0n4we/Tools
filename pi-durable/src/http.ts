@@ -5,14 +5,16 @@ export class HttpError extends Error {
   }
 }
 
-export async function readLimited(response: Response | Request, maxBytes: number): Promise<string> {
+export async function readLimitedBytes(response: Response | Request, maxBytes: number): Promise<Uint8Array<ArrayBuffer>> {
   const length = Number(response.headers.get("content-length"));
-  if (Number.isFinite(length) && length > maxBytes) throw new HttpError(413, "Body is too large");
-  if (!response.body) return "";
+  if (Number.isFinite(length) && length > maxBytes) {
+    await response.body?.cancel();
+    throw new HttpError(413, "Body is too large");
+  }
+  if (!response.body) return new Uint8Array();
   const reader = response.body.getReader();
-  const decoder = new TextDecoder();
+  const chunks: Uint8Array[] = [];
   let bytes = 0;
-  let result = "";
   try {
     while (true) {
       const { value, done } = await reader.read();
@@ -22,12 +24,19 @@ export async function readLimited(response: Response | Request, maxBytes: number
         await reader.cancel();
         throw new HttpError(413, "Body is too large");
       }
-      result += decoder.decode(value, { stream: true });
+      chunks.push(value);
     }
-    return result + decoder.decode();
   } finally {
     reader.releaseLock();
   }
+  const result = new Uint8Array(bytes);
+  let offset = 0;
+  for (const chunk of chunks) { result.set(chunk, offset); offset += chunk.byteLength; }
+  return result;
+}
+
+export async function readLimited(response: Response | Request, maxBytes: number): Promise<string> {
+  return new TextDecoder().decode(await readLimitedBytes(response, maxBytes));
 }
 
 export async function jsonBody(request: Request, maxBytes = 64 * 1024): Promise<Record<string, unknown>> {
