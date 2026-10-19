@@ -38,7 +38,7 @@ async function runtime(className = "TestAgent", state = "default", script = bund
     modules: [{ type: "ESModule", path: script }], modulesRoot: directory,
     compatibilityDate: "2026-07-30", compatibilityFlags: ["nodejs_compat"],
     durableObjects: { AGENT: { className, useSQLite: true, unsafeUniqueKey: "pi-durable-test-agent" } }, durableObjectsPersist: path.join(directory, state, "objects"),
-    bindings: { TELEGRAM_USER_ID: "123", TELEGRAM_BOT_TOKEN: "test-bot", TELEGRAM_WEBHOOK_SECRET: webhook, OPENROUTER_API_KEY: "not-a-real-key", MEMORY_PREFIX: "hermes/", WEB_SEARCH_PROVIDER: "exa", EXA_API_KEY: "test-exa-key" },
+    bindings: { TELEGRAM_USER_ID: "123", TELEGRAM_BOT_TOKEN: "test-bot", TELEGRAM_WEBHOOK_SECRET: webhook, OPENROUTER_API_KEY: "not-a-real-key", PI_MODEL: "deepseek/deepseek-v4.1-flash-1017", MEMORY_PREFIX: "hermes/", WEB_SEARCH_PROVIDER: "exa", EXA_API_KEY: "test-exa-key" },
     outboundService: async (request) => {
       const url = new URL(request.url);
       outbound.push(url.hostname);
@@ -89,7 +89,7 @@ async function runtime(className = "TestAgent", state = "default", script = bund
       if (url.hostname === "openrouter.ai" && url.pathname === "/api/v1/chat/completions") {
         expect(request.headers.get("authorization")).toBe("Bearer not-a-real-key");
         const body = await request.json() as { model: string; stream: boolean; messages: { role: string; content: unknown }[] };
-        expect(body).toMatchObject({ model: "xiaomi/mimo-v2.6-flash", stream: true, reasoning: { effort: "medium" } });
+        expect(body).toMatchObject({ model: "deepseek/deepseek-v4.1-flash-1017", stream: true, reasoning: { effort: "medium" } });
         const system = JSON.stringify(body.messages.filter(message => message.role === "system"));
         expect(system).not.toContain("legacy-removed-");
         expect(system).not.toContain("若回执不确定");
@@ -187,7 +187,7 @@ describe.sequential("real local Workers / SQLite Durable Object (no R2 binding)"
     expect((await telegram(42, "different input")).status).toBe(409);
   });
 
-  it("handles short /compact without generating a chat reply and keeps Telegram access controls", async () => {
+  it("handles /compact on empty context without generating a summary and keeps Telegram access controls", async () => {
     const previous = mf;
     mf = await runtime("TestAgent", "compact-short");
     try {
@@ -195,7 +195,7 @@ describe.sequential("real local Workers / SQLite Durable Object (no R2 binding)"
       expect((await telegram(1, "/compact", 123, "wrong-secret")).status).toBe(401);
       const queued = await telegram(1, " /compact\n");
       const job = await waitJob(queued.body.id);
-      expect(job).toMatchObject({ kind: "compact", status: "complete", compactionTaskId: expect.any(Number), parts: ["当前上下文较短，无需压缩。"] });
+      expect(job).toMatchObject({ kind: "compact", status: "complete", compactionTaskId: expect.any(Number), parts: ["当前没有可压缩的历史内容。"] });
       expect(job.submissionId).toBeUndefined();
       expect(job.speech).toBeUndefined();
       expect((await probe("/test/context")).body.context.messages).toEqual([]);
@@ -205,11 +205,14 @@ describe.sequential("real local Workers / SQLite Durable Object (no R2 binding)"
     } finally { await mf.dispose(); mf = previous; }
   });
 
-  it("places a manual compaction summary, preserves history/files and deduplicates across restart", async () => {
+  it.each([
+    { name: "short", history: ["old-fact-0", "recent-fact"] },
+    { name: "long", history: compactHistory },
+  ])("compacts $name history, preserves history/files and deduplicates across restart", async ({ name, history }) => {
     const previous = mf;
-    mf = await runtime("TestAgent", "compact-history");
+    mf = await runtime("TestAgent", `compact-${name}-history`);
     try {
-      expect((await probe("/test/context", "PUT", compactHistory)).status).toBe(200);
+      expect((await probe("/test/context", "PUT", history)).status).toBe(200);
       const memory = (await probe("/test/memory/file?path=MEMORY.md", "PUT", { content: "保留长期记忆" })).body;
       const before = received.length;
       rejectOnce = true;
@@ -224,12 +227,13 @@ describe.sequential("real local Workers / SQLite Durable Object (no R2 binding)"
       expect(view.context.head).toMatchObject({ kind: "pi.compaction", data: { reason: "manual" } });
       expect(JSON.stringify(view.context.messages)).toContain("测试压缩摘要");
       expect(JSON.stringify(view.context.messages)).not.toContain("old-fact-0");
-      expect(view.entries.filter((entry: { kind: string }) => entry.kind === "pi.user")).toHaveLength(compactHistory.length);
+      expect(view.context.messages.at(-1)).toMatchObject({ role: "user", content: history.at(-1) });
+      expect(view.entries.filter((entry: { kind: string }) => entry.kind === "pi.user")).toHaveLength(history.length);
       expect(JSON.stringify(view.entries)).toContain("old-fact-0");
       expect(JSON.stringify(view.entries)).not.toContain("/compact");
       expect((await probe("/test/memory/file?path=MEMORY.md")).body).toEqual(memory);
       await mf.dispose();
-      mf = await runtime("TestAgent", "compact-history");
+      mf = await runtime("TestAgent", `compact-${name}-history`);
       const repeated = await telegram(1, "/compact");
       expect((await waitJob(repeated.body.id)).compactionTaskId).toBe(job.compactionTaskId);
       expect(received.length).toBe(before + 1);
@@ -238,7 +242,7 @@ describe.sequential("real local Workers / SQLite Durable Object (no R2 binding)"
       expect(reopened.entries.filter((entry: { kind: string }) => entry.kind === "pi.compaction")).toHaveLength(1);
       expect((await probe(`/test/jobs/${job.id}`, "PUT")).status).toBe(200);
       await mf.dispose();
-      mf = await runtime("TestAgent", "compact-history");
+      mf = await runtime("TestAgent", `compact-${name}-history`);
       const recovered = await telegram(1, "/compact");
       expect(await waitJob(recovered.body.id)).toMatchObject({ status: "complete", compactionTaskId: job.compactionTaskId, parts: job.parts });
       expect((await probe("/test/context")).body).toEqual(reopened);
@@ -774,7 +778,7 @@ describe.sequential("real local Workers / SQLite Durable Object (no R2 binding)"
     expect((await probe("/test/memory/file?path=skills/test/nested/references/check.md")).body.content).toBe("持久化技能参考");
   });
 
-  it("removes legacy system sections without clearing history and forwards medium OpenRouter reasoning", async () => {
+  it("preserves history and forwards the configured model ID and medium reasoning without a catalog lookup", async () => {
     const fake = mf;
     const production = await runtime("ProbeAgent", "openrouter");
     mf = production;

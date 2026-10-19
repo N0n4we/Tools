@@ -170,7 +170,10 @@ export class AgentBackend extends AgentFiles {
     const registry = this.registry(store, job);
     const harness = await Harness.open(await openAgentStorage(this.ctx.storage), {
       models, registry,
-      settings: { toolExecution: "sequential", steeringMode: "all", stream: { timeoutMs: 60_000, maxRetries: 0 }, retry: { maxRetries: 1, baseDelayMs: 1000 }, progress: { partialIntervalMs: 1000, outputIntervalMs: 1000 } },
+      settings: {
+        toolExecution: "sequential", steeringMode: "all", stream: { timeoutMs: 60_000, maxRetries: 0 }, retry: { maxRetries: 1, baseDelayMs: 1000 }, progress: { partialIntervalMs: 1000, outputIntervalMs: 1000 },
+        compaction: job.kind === "compact" ? { keepRecentTokens: 0 } : undefined,
+      },
       onReport: () => console.error("Pi Durable reported an internal task error"),
     }, CONTEXT);
     let timeout: ReturnType<typeof setTimeout> | undefined;
@@ -206,7 +209,7 @@ export class AgentBackend extends AgentFiles {
             }
             const { outcome } = (await harness.waitForTask(job.compactionTaskId, CONTEXT)).state;
             if (outcome.status !== "completed") throw new Error(outcome.error?.message ?? outcome.status);
-            if (outcome.result.submissionId === undefined) return "当前上下文较短，无需压缩。";
+            if (outcome.result.submissionId === undefined) return "当前没有可压缩的历史内容。";
             const placement = await harness.submission(outcome.result.submissionId, CONTEXT);
             if (!placement || (await placement.wait(CONTEXT)).status !== "done") throw new Error("Compaction summary was not placed");
             return "上下文已压缩，历史记录和记忆文件已保留。";

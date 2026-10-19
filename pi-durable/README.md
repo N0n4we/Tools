@@ -5,7 +5,7 @@
 ## 功能
 
 - 对话：注册 Telegram Bot 到此 Worker 的 webhook；所有已提交的 assistant 消息自动发送，按 `content` 块区分思考、回复和工具调用，混合消息保持原顺序。任务执行期间的新用户消息以 Pi steering 输入接入同一对话，在当前工具轮次结束后供模型读取，不必等持续任务完全结束。
-- `/compact`：owner 在私聊发送此命令后，按现有串行队列执行 Pi Durable 上下文压缩并回复结果，不把命令交给对话模型。默认保留最近约 20,000 token；上下文较短时回复无需压缩。历史记录和记忆文件保留，摘要生成会产生模型费用。
+- `/compact`：owner 在私聊发送此命令后，按现有串行队列执行 Pi Durable 上下文压缩并回复结果，不把命令交给对话模型。手动压缩无最小 token 门槛，仅保留最近一个安全消息边界及其后的内容；没有可压缩的历史内容时跳过。自动压缩策略不变，仍默认保留最近约 20,000 token。历史记录和记忆文件保留，摘要生成会产生模型费用。
 - `/new`：owner 在私聊发送此命令后，按同一串行队列丢弃 Pi 当前会话的全部记录（含历史、摘要和工具任务），不压缩、不调用模型。正在执行的任务先完成；命令之后的消息不会接入旧会话。记忆、Skill 和其他 bash 文件、队列及 Telegram 去重/投递状态保留。删除与待发送确认原子保存，重启或重复 update 不会再次清空新会话；旧会话记录无法通过 Pi 恢复。
 - 叫醒：每天北京时间 08:00 仅向 Pi 提交一次任务。Pi 在调用工具的同一条 assistant 消息中写提醒正文，再调用 bash 的 `sleep 120s` 等待；正文会自动发送。等待后读取用户新回复并决定继续或停止；明确清醒时停止，最长 6 小时。没有专用叫醒状态、确认工具或循环调度钩子。每次模型请求刷新北京时间（Asia/Shanghai，UTC+8），任务明确要求起床，不因 UTC 或历史睡觉话题改成睡觉提醒。
 
@@ -48,6 +48,8 @@ Telegram webhook
 本机 `~/.zshrc` 中的 `EXA_API_KEY` 不会自动成为 Worker binding：本地开发需写入不受版本控制的 `.dev.vars`；线上需另行执行 `pnpm exec wrangler secret put EXA_API_KEY` 后部署。密钥不写进 `wrangler.jsonc`、提示词或虚拟 bash 环境。未设置 `WEB_SEARCH_PROVIDER` 的调用方仍沿用 Brave，以兼容原配置。
 
 应用系统提示词分段仅保留 `hermes_memory`（长期记忆与 Skill 简介）、`bash`（虚拟 shell 说明）和 `current_time`（北京时间）；不再注册 `identity`、`web_safety` 或 `telegram_speech`。网页访问与语音发送的服务端校验不变，已有会话历史和用户文件不清空。
+
+`PI_MODEL` 直接传给 OpenRouter，不加载 Pi 内置模型目录，也不预先请求模型列表；未配置时默认 `xiaomi/mimo-v2.6-flash`，模型 ID 是否可用由 OpenRouter 判断。Pi 所需的模型描述固定为当前模型适用的 1,048,576 token 上下文、131,072 token 输出上限；切换到更小窗口的模型时需同步调整 `src/pi/models.ts`。不维护本地价格表，Pi 的费用估算置零（不表示免费），实际收费以 OpenRouter 为准。
 
 模型思考启用 `thinkingLevel: "medium"`，在现有会话上生效，不清空历史或记忆；OpenRouter 请求使用 `reasoning.effort: "medium"`。这可能增加延迟和 token 费用，仍只展示 provider 实际返回的可见思考。
 
