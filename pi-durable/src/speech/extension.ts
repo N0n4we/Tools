@@ -9,7 +9,7 @@ export function speechExtension(delivery: SpeechDelivery, replyTo?: number, user
   return defineExtension({
     name: "telegram-speech",
     tools: [defineTool({
-      name: "telegram_speak", description: "将用户要求朗读的文本生成 MP3 语音并立即发给配置的 Telegram owner。仅传文本，不接受收件人、URL 或密钥。每个用户请求最多一条；会产生 OpenRouter TTS 费用。",
+      name: "telegram_speak", description: "仅用于用户明确要求的语音或朗读：将文本生成 MP3 并发送给 Telegram owner。每个请求只尝试合成与发送一次，产生 OpenRouter TTS 费用。",
       replay: "unsafe", executionMode: "sequential",
       parameters: Type.Object({ text: Type.String({ minLength: 1, maxLength: MAX_SPEECH_CHARS }) }, { additionalProperties: false }),
       execute: async (args, _api, context) => {

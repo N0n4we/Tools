@@ -8,7 +8,7 @@ import os
 import socket
 import time
 
-HOST = "gf092f87.ala.dedicated.aws.mqttce.net"
+HOST = "localhost"
 PORT = 1883
 KEEPALIVE = 20
 PING_INTERVAL = 5
@@ -54,12 +54,12 @@ def receive(stream, size):
     return data
 
 
-def hold(client_id, username, password):
+def hold(client_id, username, password, *, host=HOST, port=PORT):
     phase = "connect"
-    log(client_id, "starting", host=HOST, port=PORT, pid=os.getpid())
+    log(client_id, "starting", host=host, port=port, pid=os.getpid())
     try:
         packet = connect_packet(client_id, username, password)
-        with socket.create_connection((HOST, PORT), timeout=TIMEOUT) as stream:
+        with socket.create_connection((host, port), timeout=TIMEOUT) as stream:
             stream.sendall(packet)
             reply = receive(stream, 4)
             if reply[:3] != b"\x20\x02\x00" or reply[3] > 5:
@@ -87,6 +87,11 @@ def hold(client_id, username, password):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--host", required=True, help="Explicitly authorized MQTT TCP target")
+    parser.add_argument("--port", type=int, default=PORT)
     parser.add_argument("client_id")
     args = parser.parse_args()
-    raise SystemExit(hold(args.client_id, os.environ["MQTT_USERNAME"], os.environ["MQTT_PASSWORD"]))
+    if not 1 <= args.port <= 65535:
+        parser.error("port must be between 1 and 65535")
+    raise SystemExit(hold(args.client_id, os.environ["MQTT_USERNAME"], os.environ["MQTT_PASSWORD"],
+                          host=args.host, port=args.port))

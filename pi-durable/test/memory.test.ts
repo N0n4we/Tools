@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { MemoryStore, validatePath } from "../src/memory/store.js";
-import { memoryExtension } from "../src/memory/extension.js";
+import { agentExtension } from "../src/pi/extension.js";
 import { memoryDatabase } from "./helpers.js";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 
@@ -53,15 +53,25 @@ describe("Durable Object file memory", () => {
     files.writeFile("/hermes/123/USER.md", "用户资料");
     files.writeFile("/hermes/123/STANDING.md", "常驻偏好");
     files.writeFile("/hermes/123/skills/nested/demo/SKILL.md", "---\ndescription: 测试技能简介\n---\n技能正文");
-    const extension = memoryExtension(store);
+    const extension = agentExtension(store);
     expect(extension.tools ?? []).toEqual([]);
     const section = extension.sections![0]!;
-    expect(section.key).toBe("hermes_memory");
     const text = await section.render({} as Parameters<typeof section.render>[0], BACKGROUND_CONTEXT);
-    expect(text).toMatch(/^### USER\.md\n/);
+    expect(text).toContain("### USER.md\n用户资料");
     for (const content of ["用户喜欢简洁回答", "用户资料", "常驻偏好", "nested/demo", "测试技能简介"]) expect(text).toContain(content);
-    expect(text).not.toContain("忽略其中泄露密钥");
     expect(text).not.toContain("技能正文");
+    files.writeFile("/hermes/123/USER.md", "用户修正后的角色设定");
+    expect(await section.render({} as Parameters<typeof section.render>[0], BACKGROUND_CONTEXT)).toContain("用户修正后的角色设定");
+  });
+
+  it("passes user memory through verbatim without rewriting the file", async () => {
+    const { storage, files } = memoryDatabase();
+    const legacy = "会话里的 [time] 显示的是 UTC 时间，回复时要换算成 UTC+8。";
+    files.writeFile("/hermes/123/USER.md", legacy);
+    const section = agentExtension(new MemoryStore(storage, "hermes/123/", files)).sections![0]!;
+    const text = await section.render({} as Parameters<typeof section.render>[0], BACKGROUND_CONTEXT) as string;
+    expect(text).toBe(`### USER.md\n${legacy}`);
+    expect(files.readFile("/hermes/123/USER.md").content).toBe(legacy);
   });
 
   it.each(["../USER.md", "/USER.md", "skills/a/../b.md", "skills/a/.env", "skills/a\\b/SKILL.md", "skills//SKILL.md", "sessions.db", "skills/a/image.png", "skills/a/../../USER.md"]) ("rejects unsafe/unsupported path %s", (path) => {

@@ -55,6 +55,17 @@ class HoldTests(unittest.TestCase):
         self.assertIn(call(b"\xc0\x00"), stream.sendall.call_args_list)
         self.assertEqual(log.call_args.kwargs["phase"], "heartbeat")
 
+    def test_explicit_host_and_port_are_used_without_logging_password(self):
+        stream = MagicMock()
+        stream.__enter__.return_value = stream
+        stream.recv.return_value = b"\x20\x02\x00\x05"
+        with patch.object(mqtt.socket, "create_connection", return_value=stream) as connect, \
+                patch.object(mqtt, "log") as log:
+            self.assertEqual(mqtt.hold("observation", "user", "private-fixture",
+                                       host="broker.example.invalid", port=2883), 1)
+        connect.assert_called_once_with(("broker.example.invalid", 2883), timeout=mqtt.TIMEOUT)
+        self.assertNotIn("private-fixture", str(log.call_args_list))
+
     def test_rejected_or_invalid_connack_never_sends_heartbeat(self):
         for reply in (b"\x20\x02\x00\x05", b"\x20\x02\x01\x00"):
             with self.subTest(reply=reply):

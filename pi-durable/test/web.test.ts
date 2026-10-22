@@ -1,5 +1,17 @@
 import { describe, expect, it, vi } from "vitest";
+import { BACKGROUND_CONTEXT, withAbortSignal } from "@earendil-works/chord/context";
+import { validateToolArguments } from "@earendil-works/pi-ai/utils/validation";
 import { MAX_WEB_BYTES, WebAccess, extractHtml, publicAddress, publicUrl } from "../src/web/access.js";
+import { webExtension } from "../src/web/extension.js";
+
+function fixture(web: WebAccess) {
+  const tools = webExtension(web).tools!;
+  return (name: string, args: Record<string, unknown>, context = BACKGROUND_CONTEXT) => {
+    const tool = tools.find(tool => tool.name === name)!;
+    const validated = validateToolArguments(tool, { type: "toolCall", id: "web-test", name, arguments: args });
+    return tool.execute(validated as never, undefined as never, context);
+  };
+}
 
 function fetchMock(page: (url: URL, options?: RequestInit) => Response | Promise<Response>) {
   return vi.fn(async (input: RequestInfo | URL, options?: RequestInit) => {
@@ -179,7 +191,7 @@ describe("Web Access", () => {
     expect(JSON.parse(options!.body as string)).toEqual({ query: "中文 Exa query", type: "auto", numResults: 2, contents: { highlights: { maxCharacters: 2_000 } } });
   });
 
-  it.each([[0, 1], [20, 10]])("bounds Exa result count %i to %i", async (requested, expected) => {
+  it.each([[0, 1], [20, 20], [21, 20]])("bounds Exa result count %i to %i", async (requested, expected) => {
     const mock = vi.fn(async () => Response.json({ results: [] })) as unknown as typeof fetch;
     await new WebAccess({ WEB_SEARCH_PROVIDER: "exa", EXA_API_KEY: "test-key" }, mock).search("test", requested);
     expect(JSON.parse(vi.mocked(mock).mock.calls[0]![1]!.body as string).numResults).toBe(expected);
@@ -205,5 +217,119 @@ describe("Web Access", () => {
     await expect(new WebAccess(env, mock).search("test")).rejects.toMatchObject({ status: 502 });
     expect(vi.mocked(mock).mock.calls).toHaveLength(1);
     expect(vi.mocked(mock).mock.calls[0]?.[1]?.redirect).toBe("manual");
+  });
+});
+
+describe("pi-web-access core tool interface", () => {
+  it("provides the search/fetch tool names and rejects unsupported or obsolete parameters", () => {
+    const web = new WebAccess({});
+    expect(webExtension(web).tools!.map(tool => tool.name)).toEqual(["web_search", "fetch_content"]);
+    const invoke = fixture(web);
+    for (const args of [{ query: "test", count: 3 }, { query: "test", includeContent: true }, { query: "test", provider: "all" }, { query: "test", numResults: 21 }, { queries: Array(5).fill("test") }]) {
+      expect(() => invoke("web_search", args)).toThrow();
+    }
+    for (const args of [{ url: "https://example.com", mode: "answer" }, { urls: Array(5).fill("https://example.com") }, { url: "https://example.com", auth: true }]) {
+      expect(() => invoke("fetch_content", args)).toThrow();
+    }
+  });
+
+  it.each([{}, { query: "   " }, { queries: [" "] }])("rejects empty search input without transport: %j", async args => {
+    const mock = vi.fn() as unknown as typeof fetch;
+    const result = await fixture(new WebAccess({}, mock))("web_search", args);
+    expect(result.isError).toBe(true);
+    expect(mock).not.toHaveBeenCalled();
+  });
+
+  it("searches unique trimmed queries with Pi's numResults and up to three concurrent requests", async () => {
+    let active = 0;
+    let maximum = 0;
+    const queries: string[] = [];
+    const mock = vi.fn(async (_url, options) => {
+      const body = JSON.parse(options.body);
+      queries.push(body.query);
+      expect(body.numResults).toBe(20);
+      active++;
+      maximum = Math.max(maximum, active);
+      await new Promise(resolve => setTimeout(resolve, 5));
+      active--;
+      return Response.json({ results: [{ title: body.query, url: `https://example.com/${body.query}`, highlights: [`snippet ${body.query}`] }] });
+    }) as unknown as typeof fetch;
+    const invoke = fixture(new WebAccess({ WEB_SEARCH_PROVIDER: "exa", EXA_API_KEY: "private-test-key" }, mock));
+    const result = await invoke("web_search", { queries: ["one", "two", "three", "four"], numResults: 20 });
+    expect(result.isError).toBe(false);
+    expect(queries).toEqual(["one", "two", "three", "four"]);
+    expect(maximum).toBe(3);
+    const output = JSON.stringify(result.output);
+    for (const query of queries) expect(output).toContain(`https://example.com/${query}`);
+    expect(output).toContain("snippet one");
+    expect(output).not.toContain("private-test-key");
+    queries.length = 0;
+    await invoke("web_search", { query: "ignored", queries: [" one ", "one", "two"], numResults: 20 });
+    expect(queries).toEqual(["one", "two"]);
+  });
+
+  it("uses the configured provider unless explicitly overridden, without fallback", async () => {
+    const mock = vi.fn(async input => new URL(String(input)).hostname === "api.search.brave.com" ? Response.json({ web: { results: [] } }) : Response.json({ results: [] })) as unknown as typeof fetch;
+    const invoke = fixture(new WebAccess({ WEB_SEARCH_PROVIDER: "exa", EXA_API_KEY: "exa-key", BRAVE_SEARCH_API_KEY: "brave-key" }, mock));
+    for (const args of [{ query: "a" }, { query: "b", provider: "brave" }, { query: "c", provider: "auto" }]) {
+      expect((await invoke("web_search", args)).isError).toBe(false);
+    }
+    expect(vi.mocked(mock).mock.calls.map(([url]) => new URL(String(url)).hostname)).toEqual(["api.exa.ai", "api.search.brave.com", "api.exa.ai"]);
+  });
+
+  it("returns partial search successes and redacts transport errors", async () => {
+    const mock = vi.fn(async (_url, options) => {
+      if (JSON.parse(options.body).query === "bad") throw new Error("private-provider-key");
+      return Response.json({ results: [{ title: "Good", url: "https://example.com", highlights: ["summary"] }] });
+    }) as unknown as typeof fetch;
+    const invoke = fixture(new WebAccess({ WEB_SEARCH_PROVIDER: "exa", EXA_API_KEY: "key" }, mock));
+    const partial = await invoke("web_search", { queries: ["bad", "good"] });
+    expect(partial.isError).toBe(false);
+    expect(JSON.stringify(partial.output)).toContain("https://example.com/");
+    expect(JSON.stringify(partial.output)).not.toContain("private-provider-key");
+    expect((await invoke("web_search", { query: "bad" })).isError).toBe(true);
+  });
+
+  it("returns readable page text or the raw body without executing or rewriting it", async () => {
+    const html = "  <title>Page</title><p>Hello &amp; world</p><script>untrusted()</script>\n";
+    const invoke = fixture(new WebAccess({}, fetchMock(() => new Response(html, { headers: { "content-type": "text/html" } }))));
+    const readable = await invoke("fetch_content", { url: "https://example.com" });
+    expect(readable.output).toEqual([{ type: "text", text: "Hello & world" }]);
+    const raw = await invoke("fetch_content", { url: "https://example.com", mode: "raw" });
+    expect(raw.output).toEqual([{ type: "text", text: html }]);
+  });
+
+  it("fetches unique URLs, identifies partial errors, and does not promise nonexistent stored content", async () => {
+    const mock = fetchMock(url => url.pathname === "/bad" ? new Response("private error body", { status: 500 }) : new Response("good body", { headers: { "content-type": "text/plain" } }));
+    const invoke = fixture(new WebAccess({}, mock));
+    const partial = await invoke("fetch_content", { urls: ["https://example.com/good", "https://example.com/bad", "https://example.com/good"] });
+    expect(partial.isError).toBe(false);
+    expect(JSON.stringify(partial.output)).toContain("good body");
+    expect(JSON.stringify(partial.output)).toContain("https://example.com/bad");
+    expect(JSON.stringify(partial.output)).not.toContain("private error body");
+    expect(vi.mocked(mock).mock.calls.filter(([input]) => new URL(String(input)).hostname === "example.com")).toHaveLength(2);
+    expect((await invoke("fetch_content", { url: "https://example.com/bad" })).isError).toBe(true);
+    const bounded = await fixture(new WebAccess({}, fetchMock(() => new Response("x".repeat(24_001), { headers: { "content-type": "text/plain" } }))))("fetch_content", { url: "https://example.com" });
+    expect(JSON.stringify(bounded.output)).toContain("truncated");
+    expect(JSON.stringify(bounded.output)).not.toContain("get_search_content");
+    expect(JSON.stringify(bounded.output)).not.toContain("responseId");
+  });
+
+  it.each(["web_search", "fetch_content"])("cancels %s transport without starting a later batch", async name => {
+    const signals: AbortSignal[] = [];
+    const mock = vi.fn(async (_url, options) => {
+      signals.push(options.signal);
+      return new Promise<Response>((_resolve, reject) => options.signal.addEventListener("abort", () => reject(new Error("private transport detail")), { once: true }));
+    }) as unknown as typeof fetch;
+    const controller = new AbortController();
+    const invoke = fixture(new WebAccess({ WEB_SEARCH_PROVIDER: "exa", EXA_API_KEY: "key" }, mock));
+    const pending = invoke(name, name === "web_search" ? { queries: ["one", "two", "three", "four"] } : { urls: ["https://8.8.8.8/1", "https://8.8.8.8/2", "https://8.8.8.8/3", "https://8.8.8.8/4"] }, withAbortSignal(controller.signal, BACKGROUND_CONTEXT));
+    await vi.waitFor(() => expect(signals).toHaveLength(3));
+    controller.abort();
+    const result = await pending;
+    expect(result.isError).toBe(true);
+    expect(signals.every(signal => signal.aborted)).toBe(true);
+    expect(mock).toHaveBeenCalledTimes(3);
+    expect(JSON.stringify(result.output)).not.toContain("private transport detail");
   });
 });

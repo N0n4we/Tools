@@ -1,14 +1,14 @@
 import { AgentFiles } from "./bash/files.js";
 import { bashExtension } from "./bash/extension.js";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { AssistantEntry, Harness, LiveDoc, ToolResultEntry, createRegistry, defineExtension, section, type CompactionResult, type Conversation, type Cursor, type EntryId, type EntryRecord, type LiveState, type Registry, type Submission, type TaskId } from "@earendil-works/pi-durable";
+import { AssistantEntry, GenerationTask, Harness, LiveDoc, ToolResultEntry, createRegistry, type CompactionResult, type Conversation, type Cursor, type EntryId, type EntryRecord, type LiveState, type Registry, type Submission, type TaskId } from "@earendil-works/pi-durable";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { Env } from "./env.js";
 import { ownerId } from "./env.js";
 import { HttpError, errorResponse, jsonBody, textField } from "./http.js";
 import { MemoryStore } from "./memory/store.js";
-import { memoryExtension } from "./memory/extension.js";
-import { discardAgentSession, openAgentStorage } from "./pi/storage.js";
+import { agentExtension } from "./pi/extension.js";
+import { agentInput, discardAgentReplies, discardAgentSession, openAgentStorage } from "./pi/storage.js";
 import { openRouterModels, type AgentModels } from "./pi/models.js";
 import { TelegramError } from "./telegram.js";
 import { TelegramOutput, replyParts, type TextDelivery } from "./telegram-output.js";
@@ -24,7 +24,7 @@ const CONTEXT = BACKGROUND_CONTEXT;
 export interface Job extends TextDelivery {
   id: string;
   requestId: string;
-  kind: "user" | "scheduled" | "compact" | "new";
+  kind: "user" | "scheduled" | "compact" | "new" | "retry";
   input: string;
   chatId?: number;
   replyTo?: number;
@@ -33,6 +33,7 @@ export interface Job extends TextDelivery {
   submissionId?: number;
   compactionTaskId?: TaskId<CompactionResult>;
   outputAfter?: EntryId | null;
+  retry?: { entry?: EntryId; input?: string; replyTo: number };
 }
 
 async function jobId(requestId: string): Promise<string> {
@@ -67,7 +68,7 @@ export class AgentBackend extends AgentFiles {
         const replyTo = body.replyTo === undefined ? undefined : Number(body.replyTo);
         if (replyTo !== undefined && (!Number.isSafeInteger(replyTo) || replyTo < 1)) throw new HttpError(400, "Invalid reply message");
         const command = input.trim();
-        const kind = body.kind === "scheduled" ? "scheduled" : command === "/compact" ? "compact" : command === "/new" ? "new" : "user";
+        const kind = body.kind === "scheduled" ? "scheduled" : command === "/compact" ? "compact" : command === "/new" ? "new" : command === "/retry" ? "retry" : "user";
         const job = await this.enqueue({ requestId, input, kind, chatId, replyTo });
         this.ctx.waitUntil(this.drain());
         return Response.json({ id: job.id, status: job.status }, { status: 202 });
@@ -101,21 +102,15 @@ export class AgentBackend extends AgentFiles {
   private registry(store: MemoryStore, job: Job) {
     const registry = createRegistry();
     const web = new WebAccess(this.env);
-    registry.install(memoryExtension(store));
+    registry.install(agentExtension(store));
     registry.install(bashExtension(this, `/${store.prefix.slice(0, -1)}`, web));
     registry.install(webExtension(web));
     this.installSpeech(registry, job);
-    registry.install(defineExtension({
-      name: "telegram-agent",
-      sections: [
-        section("current_time", () => `当前时间（Asia/Shanghai，UTC+8）：${new Date().toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false })}`),
-      ],
-    }));
     return registry;
   }
 
   private installSpeech(registry: Registry, job: Job) {
-    if (job.kind !== "user") return;
+    if (job.kind !== "user" && job.kind !== "retry") return;
     installSpeechSkill(this.ctx.storage, this, this.memory.prefix);
     const key = `speech:${job.id}`;
     registry.install(speechExtension(new SpeechDelivery(this.env, {
@@ -125,7 +120,7 @@ export class AgentBackend extends AgentFiles {
         return existing;
       }),
       save: (receipt) => this.ctx.storage.put(key, receipt),
-    }), job.replyTo));
+    }), job.retry?.replyTo ?? job.replyTo));
   }
 
   private async steerPending() {
@@ -134,7 +129,7 @@ export class AgentBackend extends AgentFiles {
     for (const id of (await this.ctx.storage.list<string>({ prefix: "pending:", limit: 65 })).values()) {
       const job = await this.ctx.storage.get<Job>(`job:${id}`);
       if (this.active !== active) return;
-      if (job?.kind === "new") break;
+      if (job?.id !== active.jobId && (job?.kind === "new" || job?.kind === "retry")) break;
       if (!job || job.id === active.jobId || job.kind !== "user" || job.status !== "pending" || active.steers.has(id)) continue;
       const forwarded = (async () => {
         this.installSpeech(active.registry, job);
@@ -152,6 +147,57 @@ export class AgentBackend extends AgentFiles {
     job.parts = replyParts(reply);
     job.status = "ready";
     await this.ctx.storage.put(`job:${job.id}`, job);
+  }
+
+  private async prepareRetry(job: Job, output: TelegramOutput): Promise<boolean> {
+    if (job.createdAt + JOB_TIMEOUT_MS <= Date.now()) throw new HttpError(408, "重试请求已过期，未清理上次回复。");
+    let source: Job | undefined;
+    let reset = 0;
+    let startAfter: string | undefined;
+    while (true) {
+      const page = await this.ctx.storage.list<Job>({ prefix: "job:", startAfter, limit: 100 });
+      if (!page.size) break;
+      for (const [key, candidate] of page) {
+        startAfter = key;
+        if (candidate.sequence >= job.sequence) continue;
+        if (candidate.kind === "new" && candidate.error !== "session_reset_failed") reset = Math.max(reset, candidate.sequence);
+        if ((candidate.kind === "user" || (candidate.kind === "retry" && candidate.retry)) && candidate.chatId === job.chatId && candidate.sequence > (source?.sequence ?? 0)) source = candidate;
+      }
+    }
+    const replyTo = source?.retry?.replyTo ?? source?.replyTo;
+    if (!source || source.sequence <= reset || replyTo === undefined) {
+      await this.ready(job, "当前没有可重试的用户消息。");
+      return false;
+    }
+    const input = agentInput(this.ctx.storage.sql, source.requestId, source.retry?.entry);
+    const { models } = this.modelRuntime();
+    const harness = await Harness.open(await openAgentStorage(this.ctx.storage), { models, registry: this.registry(this.memory, job), onReport: () => console.error("Pi Durable reported an internal task error") }, CONTEXT);
+    try { await (await harness.root(CONTEXT)).abort(CONTEXT, { background: true }); }
+    finally { await harness.close(CONTEXT); }
+    await output.removeReplies({ entry: input?.entry ?? Number.MAX_SAFE_INTEGER, after: input ? input.after ?? 0 : Number.MAX_SAFE_INTEGER, replyTo, sequence: source.sequence });
+    const retry = input ? { entry: input.entry, replyTo } : { input: source.retry?.input ?? source.input, replyTo };
+    // No Harness may retain a context cache while the old response payloads are removed.
+    await this.ctx.storage.transaction(async storage => {
+      if (input) discardAgentReplies(this.ctx.storage.sql, input.entry);
+      await storage.put(`job:${job.id}`, { ...job, retry });
+    });
+    job.retry = retry;
+    return true;
+  }
+
+  private async retrySubmission(root: Conversation, harness: Harness, job: Job): Promise<Submission> {
+    const id = await root.commit(async tx => {
+      const existing = await tx.submissionByRequest(root.id, job.requestId);
+      if (existing) return existing.id;
+      const live = await tx.doc(LiveDoc, root.id);
+      if (live.run) throw new Error("Retry conversation is busy");
+      const submission = await tx.createSubmission({ type: "input", conversationId: root.id, requestId: job.requestId, status: "placed", entry: job.retry!.entry! });
+      live.run = { taskId: await tx.createTask(GenerationTask, {}, { conversationId: root.id, ownership: { kind: "conversation" } }), inputs: [submission.id] };
+      return submission.id;
+    }, CONTEXT);
+    const submission = await harness.submission(id, CONTEXT);
+    if (!submission) throw new Error("Retry submission is missing");
+    return submission;
   }
 
   private async answer(job: Job, output: TelegramOutput): Promise<void> {
@@ -251,7 +297,7 @@ export class AgentBackend extends AgentFiles {
               }
             }
           });
-          const submission = await root.submit({ type: "input", content: job.input, requestId: job.requestId }, CONTEXT);
+          const submission = job.kind === "retry" && job.retry?.entry !== undefined ? await this.retrySubmission(root, harness, job) : await root.submit({ type: "input", content: job.retry?.input ?? job.input, requestId: job.requestId }, CONTEXT);
           job.submissionId = submission.id;
           await this.ctx.storage.put(`job:${job.id}`, job);
           const active: NonNullable<AgentBackend["active"]> = { root, registry, jobId: job.id, steers: new Map() };
@@ -321,16 +367,19 @@ export class AgentBackend extends AgentFiles {
     if (job.status === "pending" || job.status === "running") {
       job.status = "running";
       await this.ctx.storage.put(`job:${job.id}`, job);
-      try { await this.answer(job, output); }
+      try {
+        if (job.kind !== "retry" || job.retry || await this.prepareRetry(job, output)) await this.answer(job, output);
+      }
       catch (error) {
-        if (error instanceof TelegramError) {
+        if (error instanceof TelegramError && !(job.kind === "retry" && !job.retry)) {
           job.status = "failed";
           job.error = error.uncertain ? "telegram_delivery_uncertain" : "telegram_delivery_failed";
           await this.finish(job);
           return;
         }
-        job.error = job.kind === "compact" ? "compaction_failed" : job.kind === "new" ? "session_reset_failed" : "agent_generation_failed";
-        job.parts = [error instanceof Error ? error.message : String(error)];
+        const cleanupFailed = job.kind === "retry" && !job.retry;
+        job.error = cleanupFailed ? "retry_cleanup_failed" : job.kind === "compact" ? "compaction_failed" : job.kind === "new" ? "session_reset_failed" : "agent_generation_failed";
+        job.parts = [cleanupFailed && !(error instanceof HttpError) ? "清理上次回复失败，未重新生成；Telegram 回复可能已部分删除，请检查删除时限后再试。" : error instanceof Error ? error.message : String(error)];
         job.status = "ready";
         await this.ctx.storage.put(`job:${job.id}`, job);
       }

@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
 import { BACKGROUND_CONTEXT, withAbortSignal } from "@earendil-works/chord/context";
+import { OutputBuffer } from "@earendil-works/chord/output";
+import type { ToolDiagnostic } from "@earendil-works/pi-durable";
 import { validateToolArguments } from "@earendil-works/pi-ai/utils/validation";
 import { memoryDatabase } from "./helpers.js";
 import { AgentFiles } from "../src/bash/files.js";
@@ -16,11 +18,20 @@ function fixture(web = new WebAccess({}, vi.fn(async () => { throw new Error("Un
   const revision = (path: string) => storage.sql.exec<{ etag: string }>("SELECT etag FROM files WHERE path = ?", `/hermes/123/${path}`).toArray()[0]?.etag ?? null;
   const tool = bashExtension(files, "/hermes/123", web).tools![0]!;
   const output: string[] = [];
+  const diagnostics: ToolDiagnostic[] = [];
+  let buffer = new OutputBuffer(tool.outputLimits);
+  const retainedOutput = () => { const result = buffer.snapshot(); return { text: result.text, truncated: result.droppedBytes > 0 }; };
   const api = {
-    output: (text: string) => output.push(text),
+    output: (text: string) => { output.push(text); buffer.push(text); },
+    retainedOutput,
+    diagnostic: (diagnostic: ToolDiagnostic) => diagnostics.push(diagnostic),
   } as Parameters<typeof tool.execute>[1];
-  const run = (command: string, timeout?: number, context = BACKGROUND_CONTEXT) => tool.execute({ command, timeout }, api, context);
-  return { storage, files, database, store, tool, output, run, revision };
+  const run = (command: string, timeout?: number, context = BACKGROUND_CONTEXT) => {
+    buffer = new OutputBuffer(tool.outputLimits);
+    diagnostics.length = 0;
+    return tool.execute({ command, timeout }, api, context);
+  };
+  return { storage, files, database, store, tool, output, diagnostics, retainedOutput, run, revision };
 }
 
 function legacyTable(database: ReturnType<typeof memoryDatabase>["database"]) {
@@ -29,17 +40,71 @@ function legacyTable(database: ReturnType<typeof memoryDatabase>["database"]) {
 }
 
 describe("durable-bash filesystem and Pi tool", () => {
+  it("uses Pi CLI's bash description and parameter descriptions", () => {
+    const { tool } = fixture();
+    expect(tool.description).toBe("Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds.");
+    expect(tool.parameters.properties.command.description).toBe("Shell command to execute");
+    expect(tool.parameters.properties.timeout.description).toBe("Timeout in seconds (optional, no default timeout)");
+    expect(tool.outputLimits).toEqual({ maxLines: 2000, maxBytes: 50 * 1024, retain: "tail" });
+  });
+
+  it.each(["seq 1 2001", "printf '%0*d' 51201 0", "printf '中文😀%.0s' {1..6000}"])("retains the tail and saves complete truncated output for later bash calls: %s", async command => {
+    const { run, output, diagnostics, retainedOutput, files } = fixture();
+    await run(command);
+    const full = output.join("");
+    const retained = retainedOutput();
+    expect(retained.truncated).toBe(true);
+    expect(Buffer.byteLength(retained.text)).toBeLessThanOrEqual(50 * 1024);
+    expect(retained.text.trimEnd().split("\n").length).toBeLessThanOrEqual(2000);
+    expect(full.endsWith(retained.text)).toBe(true);
+    expect(retained.text).not.toContain("\ufffd");
+    expect(diagnostics).toEqual([{ severity: "info", code: "full_output", message: expect.stringMatching(/^Full output: \/hermes\/123\/\.tmp\/pi-bash-[\w-]+\.log$/) }]);
+    const path = diagnostics[0]!.message.slice("Full output: ".length);
+    expect(files.readFile(path).content).toBe(full);
+    await run(`wc -c < '${path}'`);
+    expect(Number(output.at(-1)?.trim())).toBe(Buffer.byteLength(full));
+    expect(diagnostics).toEqual([]);
+  });
+
+  it.each(["seq 1 2000", "printf '%0*d' 51200 0", "true"])("does not create an output file within the limits: %s", async command => {
+    const { run, diagnostics, retainedOutput, files } = fixture();
+    await run(command);
+    expect(retainedOutput().truncated).toBe(false);
+    expect(diagnostics).toEqual([]);
+    expect(files.exists("/hermes/123/.tmp")).toBe(false);
+  });
+
+  it("preserves truncated output and its saved file for a nonzero exit", async () => {
+    const { run, output, diagnostics, files } = fixture();
+    await expect(run("seq 1 2001; printf error >&2; exit 7")).rejects.toThrow("Command exited with code 7");
+    expect(files.readFile(diagnostics[0]!.message.slice("Full output: ".length)).content).toBe(output.join(""));
+  });
+
+  it("reports spill failures without bypassing file limits or overwriting an existing file", async () => {
+    const { run, diagnostics, files } = fixture();
+    await expect(run(`printf '%0*d' ${MAX_FILE_BYTES + 1} 0`)).rejects.toThrow("Could not save full output: File is too large");
+    expect(diagnostics).toEqual([]);
+    expect(files.readdir("/hermes/123/.tmp")).toEqual([]);
+    const id = "00000000-0000-4000-8000-000000000000";
+    const path = `/hermes/123/.tmp/pi-bash-${id}.log`;
+    files.writeFile(path, "keep");
+    const uuid = vi.spyOn(crypto, "randomUUID").mockReturnValue(id);
+    try { await expect(run("seq 1 2001")).rejects.toThrow("Temporary output file already exists"); }
+    finally { uuid.mockRestore(); }
+    expect(files.readFile(path).content).toBe("keep");
+  });
+
   it("installs the speech Skill once, advertises only its description and reads its body through bash", async () => {
     const { storage, files, store, output, run, revision } = fixture();
     installSpeechSkill(storage, files, store.prefix);
     const etag = revision("skills/telegram-speech/SKILL.md");
     expect(etag).not.toBeNull();
     const prompt = await store.promptContext();
-    expect(prompt).toContain(JSON.stringify({ slug: "telegram-speech", description: "用户明确要求生成语音、朗读文字或用语音回复时使用。" }));
-    expect(prompt).not.toContain("若回执不确定");
+    expect(prompt).toContain('"slug":"telegram-speech"');
+    const skill = files.readFile("/hermes/123/skills/telegram-speech/SKILL.md").content;
+    expect(prompt).not.toContain(skill);
     await run("cat skills/telegram-speech/SKILL.md");
-    expect(output.join("")).toContain("调用 telegram_speak");
-    expect(output.join("")).toContain("不能自动重试或声称已送达");
+    expect(output.join("")).toBe(skill);
     installSpeechSkill(storage, files, store.prefix);
     expect(revision("skills/telegram-speech/SKILL.md")).toBe(etag);
   });
@@ -151,6 +216,7 @@ describe("durable-bash filesystem and Pi tool", () => {
     const { files, run } = fixture();
     for (let i = 0; i < 2000; i++) files.writeFile(`/hermes/123/skills/s${i}/SKILL.md`, "x");
     await expect(run("echo new > USER.md")).rejects.toThrow("Too many memory files");
+    await expect(run("seq 1 2001")).rejects.toThrow("Could not save full output: Too many memory files");
     expect(files.exists("/hermes/123/USER.md")).toBe(false);
     await run("echo corrected > skills/s0/SKILL.md");
     expect(files.readFile("/hermes/123/skills/s0/SKILL.md").content).toBe("corrected\n");
@@ -223,7 +289,7 @@ describe("durable-bash filesystem and Pi tool", () => {
     const { run, files } = fixture(new WebAccess({}, mock));
     const controller = new AbortController();
     const pending = run("curl -fsS https://8.8.8.8/slow; printf late > USER.md", 10, withAbortSignal(controller.signal, BACKGROUND_CONTEXT));
-    const rejected = expect(pending).rejects.toThrow("cancelled");
+    const rejected = expect(pending).rejects.toThrow("Command aborted");
     await vi.waitFor(() => expect(mock).toHaveBeenCalledOnce());
     controller.abort(new Error("cancelled"));
     await rejected;
@@ -233,11 +299,11 @@ describe("durable-bash filesystem and Pi tool", () => {
 
   it("stops writes after timeout or invocation cancellation", async () => {
     const { files, run } = fixture();
-    await expect(run("sleep 1; echo late > USER.md", 0.01)).rejects.toThrow();
+    await expect(run("sleep 1; echo late > USER.md", 0.01)).rejects.toThrow("Command timed out after 0.01 seconds");
     const controller = new AbortController();
     const pending = run("sleep 1; echo late > MEMORY.md", 1, withAbortSignal(controller.signal, BACKGROUND_CONTEXT));
     controller.abort(new Error("cancelled"));
-    await expect(pending).rejects.toThrow("cancelled");
+    await expect(pending).rejects.toThrow("Command aborted");
     await new Promise(resolve => setTimeout(resolve, 50));
     expect(files.exists("/hermes/123/USER.md")).toBe(false);
     expect(files.exists("/hermes/123/MEMORY.md")).toBe(false);
@@ -256,6 +322,20 @@ describe("durable-bash filesystem and Pi tool", () => {
     } finally { vi.useRealTimers(); }
   });
 
+  it.each([undefined, 700])("has no default tool timeout and does not shorten sleep longer than 600 seconds (timeout %s)", async timeout => {
+    const { files, run } = fixture();
+    vi.useFakeTimers();
+    try {
+      const pending = run("sleep 601s; printf resumed > USER.md", timeout);
+      await vi.advanceTimersByTimeAsync(600_999);
+      expect(files.exists("/hermes/123/USER.md")).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      await pending;
+      expect(files.readFile("/hermes/123/USER.md").content).toBe("resumed");
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { vi.useRealTimers(); }
+  });
+
   it("retains stdout and stderr for a nonzero exit", async () => {
     const { run, output } = fixture();
     await expect(run("printf visible; printf error >&2; exit 7")).rejects.toThrow("Command exited with code 7");
@@ -269,11 +349,27 @@ describe("durable-bash filesystem and Pi tool", () => {
     expect(output.join("")).toBe("/hermes/123\npersistent\n");
   });
 
-  it("rejects invalid commands and timeouts at the Pi tool boundary", () => {
+  it("defaults to Shanghai time across midnight and resets the timezone between calls", async () => {
+    const { run, output } = fixture();
+    await run("date -d '2026-12-31T15:59:59Z' '+%Y-%m-%d %H:%M:%S %z'; export TZ=UTC");
+    await run("printf '%s\\n' \"$TZ\"; date -d '2026-12-31T16:00:00Z' '+%Y-%m-%d %H:%M:%S %z'");
+    expect(output).toEqual(["2026-12-31 23:59:59 +0800\n", "Asia/Shanghai\n2027-01-01 00:00:00 +0800\n"]);
+  });
+
+  it("validates command types and size at the Pi tool boundary", () => {
     const { tool } = fixture();
-    for (const args of [{ command: "" }, { command: "x".repeat(32_001) }, ...[0, -1, 601].map(timeout => ({ command: "true", timeout }))]) {
+    for (const args of [{ command: "" }, { command: "x".repeat(32_001) }, { command: {} }, { command: "true", timeout: "invalid" }]) {
       expect(() => validateToolArguments(tool, { type: "toolCall", id: "bash-test", name: "bash", arguments: args })).toThrow();
     }
+  });
+
+  it("validates timeout values before any command runs, matching Pi's platform maximum", async () => {
+    const { run, files } = fixture();
+    for (const timeout of [0, -1, NaN, Infinity, 2_147_483.648]) {
+      await expect(run("printf unsafe > USER.md", timeout)).rejects.toThrow("Invalid timeout");
+    }
+    expect(files.exists("/hermes/123/USER.md")).toBe(false);
+    await run("true", 2_147_483.647);
   });
 
   it.each([["a_b", "axb"], ["a%b", "axxb"], ["A", "a"], ["🙂", "🙂x"]])("keeps directory operations for %s isolated from %s", (name, sibling) => {

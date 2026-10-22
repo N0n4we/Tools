@@ -19,8 +19,8 @@ export function openRouterModels(env: Env): AgentModels {
     models: [{
       id: modelId, name: modelId, provider: "openrouter", api: "openai-completions", baseUrl: "https://openrouter.ai/api/v1",
       reasoning: true, input: ["text"],
-      // shortcut: limits match the current 1M-context models; adjust when switching to smaller models.
-      contextWindow: 1_048_576, maxTokens: 131_072,
+      // shortcut: the context window matches the current 1M-context models; adjust for smaller models.
+      contextWindow: 1_048_576, maxTokens: 80_000,
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       compat: { supportsStrictMode: true, requiresReasoningContentOnAssistantMessages: modelId.startsWith("deepseek/") },
     }],

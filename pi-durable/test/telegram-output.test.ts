@@ -1,20 +1,24 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AssistantEntry, ToolResultEntry, type EntryRecord } from "@earendil-works/pi-durable";
 import { fauxAssistantMessage, fauxText, fauxThinking, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
-import { TelegramOutput, type TextDelivery } from "../src/telegram-output.js";
+import { replyParts, TelegramOutput, type TextDelivery } from "../src/telegram-output.js";
 
 const signal = new AbortController().signal;
 const entry = (id: number, message: ReturnType<typeof fauxAssistantMessage>) => ({ id, conversationId: 1, kind: AssistantEntry.kind, model: [message] }) as EntryRecord;
 
 function fixture() {
   const rows = new Map<string, TextDelivery>();
-  const storage = { get: async (key: string) => structuredClone(rows.get(key)), put: async (key: string, value: TextDelivery) => { rows.set(key, structuredClone(value)); } } as unknown as DurableObjectStorage;
+  const storage = {
+    get: async (key: string) => structuredClone(rows.get(key)),
+    put: async (key: string, value: TextDelivery) => { rows.set(key, structuredClone(value)); },
+    list: async ({ prefix, startAfter, limit }: { prefix: string; startAfter?: string; limit: number }) => new Map([...rows].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).filter(([key]) => key.startsWith(prefix) && (startAfter === undefined || key > startAfter)).slice(0, limit).map(([key, value]) => [key, structuredClone(value)])),
+  } as unknown as DurableObjectStorage;
   const calls: { method: string; body: any }[] = [];
   let next = 0;
   vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit) => {
     const body = JSON.parse(init.body as string);
     calls.push({ method: url.split("/").at(-1)!, body });
-    return Response.json({ ok: true, result: { message_id: body.message_id ?? ++next } });
+    return Response.json({ ok: true, result: url.endsWith("/deleteMessages") ? true : { message_id: body.message_id ?? ++next } });
   }));
   const reopen = () => new TelegramOutput(storage, "test-bot", { id: "job", chatId: 123, replyTo: 2 });
   return { rows, calls, reopen, output: reopen() };
@@ -23,6 +27,63 @@ function fixture() {
 afterEach(() => { vi.unstubAllGlobals(); vi.useRealTimers(); });
 
 describe("durable Telegram presentation", () => {
+  it("deletes only reply receipts, including earlier streamed thinking, voice and paginated batches", async () => {
+    const { rows, calls, output } = fixture();
+    const receipt = (ids: number[]): TextDelivery => ({ status: "complete", sentIds: ids, nextPart: 1, deliveryAttempts: 0 });
+    rows.set("assistant:10:0:0", receipt([5]));
+    rows.set("thinking:old:0:0:0", receipt([6]));
+    rows.set("thinking:active:10:0:0", receipt([9]));
+    rows.set("job:voice", { ...receipt([12]), sequence: 2 } as TextDelivery);
+    rows.set("speech:voice", { status: "sent", messageId: 13 } as unknown as TextDelivery);
+    for (let i = 0; i < 250; i++) rows.set(`assistant:${100 + i}:0:0`, { ...receipt([1000 + i, 1000 + i]), editId: 1000 + i });
+    const original = structuredClone(rows);
+    await output.removeReplies({ entry: 20, after: 10, replyTo: 10, sequence: 2 });
+    expect(calls.every(call => call.method === "deleteMessages" && call.body.chat_id === 123 && call.body.message_ids.length <= 100)).toBe(true);
+    const deleted = calls.flatMap(call => call.body.message_ids).sort((a, b) => a - b);
+    expect(deleted).toEqual([9, 12, 13, ...Array.from({ length: 250 }, (_, i) => 1000 + i)]);
+    expect(rows).toEqual(original);
+  });
+
+  it("stops a retry rather than silently skipping an outgoing message with no known ID", async () => {
+    const { rows, calls, output } = fixture();
+    rows.set("assistant:30:0:0", { status: "failed", error: "telegram_delivery_uncertain", nextPart: 0, deliveryAttempts: 1 });
+    await expect(output.removeReplies({ entry: 20, after: 10, replyTo: 10, sequence: 2 })).rejects.toThrow("发送回执不完整");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("keeps Markdown indentation and timestamps at later chunk boundaries intact", () => {
+    expect(replyParts("[2026-10-25 12:03:34]\n    indented code")).toEqual(["    indented code"]);
+    expect(replyParts(`${"x".repeat(4000)}[2026-10-25 12:03:34]正文`)).toEqual(["x".repeat(4000), "[2026-10-25 12:03:34]正文"]);
+  });
+
+  it.each(["[2026-10-25 12-03-34]", "[2026-10-25 12:03:34]"])("removes echoed metadata %s without changing role actions, quoted dates or stored history", async prefix => {
+    const { output, calls, reopen } = fixture();
+    const message = fauxAssistantMessage([
+      fauxText(`${prefix}\n${prefix}（轻轻点头）你好。`),
+      fauxText(`${prefix}\n\n`),
+      fauxText("记录时间：[2026-10-25 12:03:34]。"),
+      fauxText("```text\n[2026-10-25 12:03:34]\n```"),
+    ]);
+    const original = structuredClone(message);
+    const record = entry(10, message);
+    await output.entry(record, 0, signal);
+    await reopen().entry(record, 0, signal);
+    expect(calls.map(call => call.body.rich_message.markdown)).toEqual([
+      "（轻轻点头）你好。", "记录时间：[2026-10-25 12:03:34]。", "```text\n[2026-10-25 12:03:34]\n```",
+    ]);
+    expect(message).toEqual(original);
+  });
+
+  it("removes timestamp metadata from thinking before publishing progress or committed reasoning", async () => {
+    const { output, calls } = fixture();
+    const message = fauxAssistantMessage([fauxThinking("[2026-10-25 12:03:34]\n检查角色要求。"), fauxText("（点头）好。")]);
+    await output.partial(message, 0, 1, signal);
+    await output.entry(entry(10, message), 0, signal);
+    expect(calls.map(call => call.body.text ?? call.body.rich_message.markdown)).toEqual([
+      "<blockquote expandable>检查角色要求。</blockquote>", "（点头）好。",
+    ]);
+  });
+
   it("splits mixed content in source order and updates the tool card only from execution evidence", async () => {
     const { output, calls } = fixture();
     const call = fauxToolCall("bash", { command: "sleep 1" }, { id: "call-1" });
@@ -92,7 +153,7 @@ describe("durable Telegram presentation", () => {
   it("keeps length-limited partial replies with an explicit status", async () => {
     const { output, calls } = fixture();
     await output.entry(entry(10, fauxAssistantMessage("部分正文", { stopReason: "length" })), 0, signal);
-    expect(calls.map(call => call.body.rich_message.markdown)).toEqual(["（回复状态：length）", "部分正文"]);
+    expect(calls.map(call => call.body.rich_message.markdown)).toEqual(['(stopReason: "length")', "部分正文"]);
   });
 
   it("does not downgrade or duplicate a completed tool card when history is replayed", async () => {

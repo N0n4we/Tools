@@ -1,4 +1,7 @@
+import contextlib
+import io
 import ssl
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,6 +11,15 @@ import mqtt_failures as mqtt
 
 
 class MQTTTests(unittest.TestCase):
+    def test_main_requires_explicit_configuration_before_network_access(self):
+        with patch.object(sys, "argv", ["mqtt_failures.py"]), \
+                patch.object(mqtt.socket, "getaddrinfo") as resolve, \
+                contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as error:
+                mqtt.main()
+        self.assertEqual(error.exception.code, 2)
+        resolve.assert_not_called()
+
     def setUp(self):
         self.raw = MagicMock()
         self.raw.__enter__.return_value = self.raw

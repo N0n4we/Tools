@@ -9,7 +9,7 @@ describe("Workers model credentials", () => {
     vi.stubEnv("OPENROUTER_API_KEY", "wrong-ambient-key");
     const runtime = openRouterModels({ OPENROUTER_API_KEY: "workers-secret" } as Env);
     expect((await runtime.models.getAuth("openrouter"))?.auth.apiKey).toBe("workers-secret");
-    expect(runtime.models.getModel(runtime.model.provider, runtime.model.modelId)).toBeDefined();
+    expect(runtime.models.getModel(runtime.model.provider, runtime.model.modelId)).toMatchObject({ maxTokens: 80_000 });
   });
 
   it.each(["deepseek/deepseek-v4.1-flash-1017", "not-a-model"])("registers only the configured ID without a catalog or preflight request: %s", modelId => {

@@ -176,7 +176,6 @@ describe("owner-only durable speech delivery", () => {
   it("exposes only a text argument, is unsafe to replay and blocks automatic wakeup jobs", async () => {
     const mock = fetcher(async () => audio());
     const extension = speechExtension(new SpeechDelivery(env, journal().storage, mock), undefined, false);
-    expect(extension.sections ?? []).toEqual([]);
     const tool = extension.tools![0]!;
     expect(tool.name).toBe("telegram_speak");
     expect(tool.replay).toBe("unsafe");

@@ -2,7 +2,8 @@ import { AssistantEntry, ToolResultEntry, type EntryRecord, type TaskRecord, typ
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { JsonValue } from "@earendil-works/chord";
 import { requiredSecret } from "./env.js";
-import { activityEvidence, splitTelegramText, TelegramBot, TelegramError, type TelegramFormat, type TelegramView } from "./telegram.js";
+import { HttpError } from "./http.js";
+import { activityEvidence, splitTelegramText, stripTimePrefix, TelegramBot, TelegramError, type TelegramFormat, type TelegramView } from "./telegram.js";
 
 export interface TextDelivery {
   status: "pending" | "running" | "ready" | "sending" | "complete" | "failed";
@@ -19,7 +20,9 @@ export interface TextDelivery {
 }
 
 export function replyParts(reply: string): string[] {
-  let truncated = reply.slice(0, 20_000);
+  const text = stripTimePrefix(reply);
+  if (!text.trim()) return [];
+  let truncated = text.slice(0, 20_000);
   if (/[\uD800-\uDBFF]$/.test(truncated)) truncated = truncated.slice(0, -1);
   return splitTelegramText(truncated);
 }
@@ -28,7 +31,37 @@ export class TelegramOutput {
   private readonly tools = new Map<string, { key: string; view: Extract<TelegramView, { type: "tool" }> }>();
   private readonly progressAt = new Map<string, number>();
 
-  constructor(private readonly storage: DurableObjectStorage, private readonly token: string | undefined, private readonly job: { id: string; chatId?: number; replyTo?: number }) {}
+  constructor(private readonly storage: DurableObjectStorage, private readonly token: string | undefined, private readonly job: { id: string; chatId?: number; replyTo?: number; retry?: { replyTo: number } }) {}
+
+  async removeReplies(from: { entry: number; after: number; replyTo: number; sequence: number }): Promise<void> {
+    if (this.job.chatId === undefined) throw new HttpError(400, "Retry requires a Telegram chat");
+    const bot = new TelegramBot(requiredSecret(this.token, "TELEGRAM_BOT_TOKEN"));
+    const seen = new Set<number>();
+    let batch: number[] = [];
+    // shortcut: scans saved receipts; index by input boundary if cleanup becomes slow.
+    for (const prefix of ["assistant:", "thinking:", "job:", "speech:"]) {
+      let startAfter: string | undefined;
+      while (true) {
+        const page = await this.storage.list<{ sentIds?: number[]; editId?: number; messageId?: number; sequence?: number; status?: string; error?: string }>({ prefix, startAfter, limit: 100 });
+        if (!page.size) break;
+        for (const [key, receipt] of page) {
+          startAfter = key;
+          const related = prefix === "assistant:" ? Number(key.split(":")[1]) > from.entry
+            : prefix === "thinking:" ? Number(key.split(":")[2]) >= from.after
+            : prefix === "job:" ? (receipt.sequence ?? 0) >= from.sequence
+            : ((await this.storage.get<{ sequence: number }>(`job:${key.slice(prefix.length)}`))?.sequence ?? 0) >= from.sequence;
+          if (related && (receipt.status === "sending" || receipt.status === "uncertain" || receipt.error === "telegram_delivery_uncertain") && !receipt.editId && !receipt.messageId) throw new HttpError(409, "上次回复的发送回执不完整，无法确认应删除的 Telegram 消息；未重试。");
+          for (const id of [...(receipt.sentIds ?? []), receipt.editId, receipt.messageId]) {
+            if (id === undefined || (!related && id <= from.replyTo) || seen.has(id)) continue;
+            seen.add(id);
+            batch.push(id);
+            if (batch.length === 100) { await bot.deleteMessages(this.job.chatId, batch); batch = []; }
+          }
+        }
+      }
+    }
+    if (batch.length) await bot.deleteMessages(this.job.chatId, batch);
+  }
 
   async deliver(key: string, delivery: TextDelivery, signal?: AbortSignal): Promise<void> {
     if (delivery.status === "complete" || delivery.status === "failed") return;
@@ -47,7 +80,7 @@ export class TelegramOutput {
       try {
         const bot = new TelegramBot(requiredSecret(this.token, "TELEGRAM_BOT_TOKEN"));
         const part = delivery.parts![delivery.nextPart]!;
-        const replyTo = delivery.nextPart === 0 ? this.job.replyTo : undefined;
+        const replyTo = delivery.nextPart === 0 ? this.job.retry?.replyTo ?? this.job.replyTo : undefined;
         let id: number;
         if (typeof part === "string") id = await bot.send(this.job.chatId, part, replyTo, signal);
         else {
@@ -101,6 +134,7 @@ export class TelegramOutput {
         return;
       }
     }
+    if (view.type !== "tool" && !view.text.trim()) return;
     delivery = { status: "ready", parts: [view], nextPart: 0, deliveryAttempts: 0, revision, ...(delivery ? { editId: delivery.sentIds![0]!, format: delivery.format } : {}) };
     await this.flush(key, delivery, signal);
   }
@@ -147,7 +181,7 @@ export class TelegramOutput {
     for (const [messageIndex, message] of (entry.model ?? []).entries()) {
       if (message.role !== "assistant") continue;
       if (message.stopReason === "error" || message.stopReason === "aborted") continue;
-      if (!["stop", "toolUse"].includes(message.stopReason)) await this.send(`${key}:${messageIndex}:status`, { type: "text", text: `（回复状态：${message.stopReason}）` }, 0, signal);
+      if (!["stop", "toolUse"].includes(message.stopReason)) await this.send(`${key}:${messageIndex}:status`, { type: "text", text: `(stopReason: "${message.stopReason}")` }, 0, signal);
       if (!message.content.length || message.content.every(block => block.type === "text" && !block.text)) await this.send(`${key}:${messageIndex}:empty`, { type: "text", text: "（空回复）" }, 0, signal);
       for (const [index, block] of message.content.entries()) {
         switch (block.type) {

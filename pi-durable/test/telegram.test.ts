@@ -46,6 +46,19 @@ describe("Telegram", () => {
     expect(body).toMatchObject({ chat_id: 123, reply_parameters: { message_id: 1 }, link_preview_options: { is_disabled: true } });
     expect(body.parse_mode).toBeUndefined();
   });
+  it("deletes only the supplied message IDs and validates Telegram batch limits", async () => {
+    const mock = vi.fn(async () => Response.json({ ok: true, result: true })) as unknown as typeof fetch;
+    const bot = new TelegramBot("test", mock);
+    await bot.deleteMessages(123, [9, 10]);
+    expect(vi.mocked(mock).mock.calls[0]?.[0]).toMatch(/\/deleteMessages$/);
+    expect(JSON.parse(vi.mocked(mock).mock.calls[0]![1]!.body as string)).toEqual({ chat_id: 123, message_ids: [9, 10] });
+    for (const ids of [[], [0], [1.5], [NaN], Array.from({ length: 101 }, (_, i) => i + 1)]) await expect(bot.deleteMessages(123, ids)).rejects.toThrow("Expected 1–100 Telegram message IDs");
+    expect(mock).toHaveBeenCalledTimes(1);
+    const rejected = vi.fn(async () => Response.json({ ok: false }, { status: 400 })) as unknown as typeof fetch;
+    await expect(new TelegramBot("test", rejected).deleteMessages(123, [9])).rejects.toMatchObject({ statusCode: 400, uncertain: false });
+    const malformed = vi.fn(async () => Response.json({ ok: true, result: {} })) as unknown as typeof fetch;
+    await expect(new TelegramBot("test", malformed).deleteMessages(123, [9])).rejects.toMatchObject({ uncertain: true });
+  });
   it("distinguishes a known rate-limit rejection from uncertain delivery", async () => {
     const rateLimit = vi.fn(async () => Response.json({ ok: false, description: "private-request-data", parameters: { retry_after: 2 } }, { status: 429 })) as unknown as typeof fetch;
     await expect(new TelegramBot("test", rateLimit).send(123, "x")).rejects.toMatchObject({ retryable: true, retryAfter: 2, uncertain: false, message: "Telegram delivery failed" });

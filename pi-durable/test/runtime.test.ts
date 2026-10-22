@@ -10,6 +10,13 @@ import { MAX_FILE_BYTES } from "../src/memory/store.js";
 const webhook = "test-webhook-secret";
 const received: { text: string; chat_id: number; rich_message?: any; parse_mode?: string }[] = [];
 const telegramCalls: { method: string; body: any }[] = [];
+const receivedById = new Map<number, typeof received[number]>();
+const sentMessageIds: number[] = [];
+const deletedMessageIds = new Set<number>();
+const incomingMessageIds = new Map<number, number>();
+let nextTelegramId: number | undefined;
+let rejectDeleteOnce = false;
+let ambiguousDeleteOnce = false;
 const outbound: string[] = [];
 const voices: { chatId: string; bytes: number; replyTo?: number }[] = [];
 const compactHistory = Array.from({ length: 6 }, (_, index) => `old-fact-${index}\n${"history ".repeat(4000)}`);
@@ -63,7 +70,20 @@ async function runtime(className = "TestAgent", state = "default", script = bund
         expect(audio.type).toBe("audio/mpeg");
         expect(new Uint8Array(await audio.arrayBuffer()).slice(0, 3)).toEqual(new Uint8Array([0x49, 0x44, 0x33]));
         voices.push({ chatId: String(form.get("chat_id")), bytes: audio.size, ...(form.get("reply_parameters") ? { replyTo: JSON.parse(form.get("reply_parameters") as string).message_id } : {}) });
-        return Response.json({ ok: true, result: { message_id: 10_000 + voices.length } });
+        const messageId = nextTelegramId === undefined ? 10_000 + voices.length : nextTelegramId++;
+        sentMessageIds.push(messageId);
+        return Response.json({ ok: true, result: { message_id: messageId } });
+      }
+      if (url.hostname === "api.telegram.org" && url.pathname === "/bottest-bot/deleteMessages") {
+        const body = await request.json() as { chat_id: number; message_ids: number[] };
+        telegramCalls.push({ method: "deleteMessages", body });
+        expect(body.chat_id).toBe(123);
+        expect(body.message_ids.length).toBeGreaterThan(0);
+        expect(body.message_ids.length).toBeLessThanOrEqual(100);
+        if (rejectDeleteOnce) { rejectDeleteOnce = false; return Response.json({ ok: false, description: "message can't be deleted" }, { status: 400 }); }
+        for (const id of body.message_ids) deletedMessageIds.add(id);
+        if (ambiguousDeleteOnce) { ambiguousDeleteOnce = false; throw new Error("simulated lost delete receipt"); }
+        return Response.json({ ok: true, result: true });
       }
       if (url.hostname === "api.telegram.org" && ["/bottest-bot/sendMessage", "/bottest-bot/sendRichMessage", "/bottest-bot/editMessageText"].includes(url.pathname)) {
         if (ambiguousOnce) { ambiguousOnce = false; throw new Error("simulated network failure"); }
@@ -75,11 +95,18 @@ async function runtime(className = "TestAgent", state = "default", script = bund
         const tool = body.rich_message?.blocks?.[0];
         const text = body.text ?? body.rich_message?.markdown ?? `${tool.summary[0].text} ${tool.summary[2].text}\n${tool.blocks[0].blocks[0].text}`;
         const rendered = { ...body, text };
+        let messageId: number;
         if (method === "editMessageText") {
-          expect(received[body.message_id - 1]).toBeDefined();
-          Object.assign(received[body.message_id - 1]!, rendered);
-        } else received.push(rendered);
-        return Response.json({ ok: true, result: { message_id: body.message_id ?? received.length } });
+          expect(receivedById.has(body.message_id)).toBe(true);
+          Object.assign(receivedById.get(body.message_id)!, rendered);
+          messageId = body.message_id;
+        } else {
+          received.push(rendered);
+          messageId = nextTelegramId === undefined ? received.length : nextTelegramId++;
+          receivedById.set(messageId, rendered);
+          sentMessageIds.push(messageId);
+        }
+        return Response.json({ ok: true, result: { message_id: messageId } });
       }
       if (url.hostname === "cloudflare-dns.com") return Response.json({ Status: 0, Answer: url.searchParams.get("type") === "A" ? [{ type: 1, data: "8.8.8.8" }] : [] });
       if (url.hostname === "example.com") {
@@ -89,11 +116,13 @@ async function runtime(className = "TestAgent", state = "default", script = bund
       if (url.hostname === "openrouter.ai" && url.pathname === "/api/v1/chat/completions") {
         expect(request.headers.get("authorization")).toBe("Bearer not-a-real-key");
         const body = await request.json() as { model: string; stream: boolean; messages: { role: string; content: unknown }[] };
-        expect(body).toMatchObject({ model: "deepseek/deepseek-v4.1-flash-1017", stream: true, reasoning: { effort: "medium" } });
+        expect(body).toMatchObject({ model: "deepseek/deepseek-v4.1-flash-1017", stream: true, max_completion_tokens: 80_000, reasoning: { effort: "medium" } });
         const system = JSON.stringify(body.messages.filter(message => message.role === "system"));
         expect(system).not.toContain("legacy-removed-");
-        expect(system).not.toContain("若回执不确定");
         expect(system).toContain("telegram-speech");
+        for (const message of body.messages.filter(message => ["user", "assistant", "tool"].includes(message.role))) {
+          expect(message.content).toEqual(expect.stringMatching(/^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\]\n/));
+        }
         const thinking = { id: "test-completion", object: "chat.completion.chunk", created: 1, model: body.model, choices: [{ index: 0, delta: { role: "assistant", reasoning: "OpenRouter 可见思考。" }, finish_reason: null }] };
         const chunk = { id: "test-completion", object: "chat.completion.chunk", created: 1, model: body.model, choices: [{ index: 0, delta: { role: "assistant", content: "OpenRouter 本地完成。" }, finish_reason: null }] };
         const end = { ...chunk, choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 } };
@@ -116,9 +145,10 @@ async function probe(route: string, method = "GET", body?: unknown) {
 }
 
 async function telegram(updateId: number, text: string, from = 123, secret = webhook) {
+  if (nextTelegramId !== undefined && !incomingMessageIds.has(updateId)) incomingMessageIds.set(updateId, nextTelegramId++);
   const response = await mf.dispatchFetch("https://agent.invalid/telegram/webhook", {
     method: "POST", headers: { "content-type": "application/json", "x-telegram-bot-api-secret-token": secret },
-    body: JSON.stringify({ update_id: updateId, message: { message_id: updateId + 1, from: { id: from }, chat: { id: 123, type: "private" }, text } }),
+    body: JSON.stringify({ update_id: updateId, message: { message_id: nextTelegramId === undefined ? updateId + 1 : incomingMessageIds.get(updateId), from: { id: from }, chat: { id: 123, type: "private" }, text } }),
   });
   return { status: response.status, body: await responseJSON(response) };
 }
@@ -185,6 +215,49 @@ describe.sequential("real local Workers / SQLite Durable Object (no R2 binding)"
 
   it("detects a requestId replay with a different body", async () => {
     expect((await telegram(42, "different input")).status).toBe(409);
+  });
+
+  it("timestamps model messages in Beijing time across midnight without rewriting history or Telegram output", async () => {
+    const previous = mf;
+    mf = await runtime("TestAgent", "message-time");
+    try {
+      const userTime = Date.parse("2026-12-31T15:59:59Z");
+      const assistantTime = Date.parse("2026-12-31T16:00:00Z");
+      await probe(`/test/context?timestamp=${userTime}`, "PUT", ["历史用户消息"]);
+      await probe(`/test/context?timestamp=${assistantTime}`, "POST", ["历史助手消息"]);
+      const before = received.length;
+      const queued = await telegram(1, "remember");
+      expect(await waitJob(queued.body.id)).toMatchObject({ status: "complete" });
+      const messages = (await probe("/test/context")).body.context.messages.filter((message: { role: string }) => message.role !== "system");
+      expect(messages.slice(0, 2)).toMatchObject([
+        { role: "user", content: "历史用户消息", timestamp: userTime },
+        { role: "assistant", content: [{ type: "text", text: "历史助手消息" }], timestamp: assistantTime },
+      ]);
+      expect(JSON.stringify(messages)).not.toMatch(/\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\]/);
+      expect(received.slice(before).map(message => message.text)).toEqual([
+        toolText("printf '测试用户喜欢简洁回答\\n' >> MEMORY.md; cat MEMORY.md"), "本地工具执行完成。",
+      ]);
+    } finally { await mf.dispose(); mf = previous; }
+  });
+
+  it("loads role formatting before the first reply and keeps echoed timestamps out of the second Telegram reply across restart", async () => {
+    const previous = mf;
+    mf = await runtime("TestAgent", "role-format");
+    try {
+      const user = (await probe("/test/memory/file?path=USER.md", "PUT", { content: "你是测试角色小岚。" })).body;
+      const standing = (await probe("/test/memory/file?path=STANDING.md", "PUT", { content: "动作必须用（）包裹。" })).body;
+      const before = received.length;
+      const first = await telegram(1, "role-format first");
+      const firstJob = await waitJob(first.body.id);
+      expect(firstJob.status, JSON.stringify(firstJob)).toBe("complete");
+      await mf.dispose();
+      mf = await runtime("TestAgent", "role-format");
+      const second = await telegram(2, "role-format second");
+      expect(await waitJob(second.body.id)).toMatchObject({ status: "complete" });
+      expect(received.slice(before).map(message => message.text)).toEqual(["（轻轻点头）第一轮。", "（微笑）第二轮。"]);
+      expect((await probe("/test/memory/file?path=USER.md")).body).toEqual(user);
+      expect((await probe("/test/memory/file?path=STANDING.md")).body).toEqual(standing);
+    } finally { await mf.dispose(); mf = previous; }
   });
 
   it("handles /compact on empty context without generating a summary and keeps Telegram access controls", async () => {
@@ -384,10 +457,253 @@ describe.sequential("real local Workers / SQLite Durable Object (no R2 binding)"
       expect(await waitJob(next.body.id)).toMatchObject({ status: "complete", kind: "user" });
       const view = (await probe("/test/context")).body;
       expect(JSON.stringify(view.context.messages)).toContain("hello-after-new");
-      expect(JSON.stringify(view.entries)).not.toContain("这是唤醒");
+      expect(JSON.stringify(view.entries)).not.toContain("定时文字叫醒");
       expect(JSON.stringify(view.entries)).not.toContain("/new");
       expect(received.slice(before).map(message => message.text)).toEqual([...wakeupAssistant, "本地工具执行完成。", "已开始新会话，旧会话记录已丢弃；记忆和 Skill 文件已保留。", "本地测试回答。"]);
     } finally { await mf.dispose(); mf = previous; }
+  }, 10_000);
+
+  it("handles exact /retry without history and preserves Telegram access controls", async () => {
+    const previous = mf;
+    mf = await runtime("ProbeAgent", "retry-empty");
+    try {
+      expect((await telegram(1, "/retry", 456)).body.ignored).toBe(true);
+      expect((await telegram(1, "/retry", 123, "wrong-secret")).status).toBe(401);
+      const before = outbound.length;
+      const queued = await telegram(1, " /retry\n");
+      expect(await waitJob(queued.body.id)).toMatchObject({ kind: "retry", status: "complete", parts: ["当前没有可重试的用户消息。"] });
+      expect(outbound.slice(before)).toEqual(["api.telegram.org"]);
+      expect((await probe("/test/context")).body.context.messages).toEqual([]);
+      for (const [index, input] of ["/retrying", "/retry extra"].entries()) {
+        const normal = await telegram(index + 2, input);
+        expect(await waitJob(normal.body.id)).toMatchObject({ kind: "user", status: "complete" });
+      }
+    } finally { await mf.dispose(); mf = previous; }
+  });
+
+  it("retries the original input, deletes its thinking/text/tool replies, and recovers without repeating cleanup", async () => {
+    const previous = mf;
+    const state = "retry-history";
+    mf = await runtime("TestAgent", state);
+    nextTelegramId = 100_000; incomingMessageIds.clear(); deletedMessageIds.clear();
+    try {
+      const earlier = await telegram(1, "earlier-turn");
+      expect((await waitJob(earlier.body.id)).status).toBe("complete");
+      const earlierIds = sentMessageIds.slice(-1);
+      const messages = sentMessageIds.length;
+      const source = await telegram(2, "intermediate-text");
+      const sourceJob = await waitJob(source.body.id);
+      const oldIds = sentMessageIds.slice(messages);
+      expect(oldIds).toHaveLength(6);
+      const before = (await probe("/test/context")).body;
+      const input = before.entries.find((entry: any) => entry.kind === "pi.user");
+      const [queued, duplicate] = await Promise.all([telegram(3, "/retry"), telegram(3, "/retry")]);
+      expect(duplicate.body.id).toBe(queued.body.id);
+      const retried = await waitJob(queued.body.id);
+      expect(retried).toMatchObject({ kind: "retry", status: "complete", retry: { entry: input.id, replyTo: sourceJob.replyTo }, submissionId: expect.any(Number) });
+      expect(deletedMessageIds).toEqual(new Set(oldIds));
+      expect(earlierIds.every(id => !deletedMessageIds.has(id))).toBe(true);
+      const after = (await probe("/test/context")).body;
+      expect(after.entries.filter((entry: any) => entry.id <= input.id)).toEqual(before.entries.filter((entry: any) => entry.id <= input.id));
+      for (const old of before.entries.filter((entry: any) => entry.id > input.id)) {
+        const removed = after.entries.find((entry: any) => entry.id === old.id);
+        expect(removed).toMatchObject({ id: old.id, kind: "telegram.discarded" });
+        for (const field of ["model", "data", "edits", "head"]) expect(removed[field]).toBeUndefined();
+      }
+      expect(after.context.messages.filter((message: any) => message.role === "user" && message.content === "intermediate-text")).toHaveLength(1);
+      expect(JSON.stringify(after.entries)).not.toContain("/retry");
+      expect(received.at(-1)).toMatchObject({ reply_parameters: { message_id: sourceJob.replyTo } });
+      const calls = telegramCalls.length;
+      const sends = sentMessageIds.length;
+      await mf.dispose(); mf = await runtime("TestAgent", state);
+      await probe(`/test/jobs/${queued.body.id}`, "PUT");
+      expect((await telegram(3, "/retry")).body.id).toBe(queued.body.id);
+      expect((await waitJob(queued.body.id)).status).toBe("complete");
+      expect(telegramCalls).toHaveLength(calls);
+      expect(sentMessageIds).toHaveLength(sends);
+      const again = await telegram(4, "/retry");
+      expect(await waitJob(again.body.id)).toMatchObject({ status: "complete", retry: { entry: input.id, replyTo: sourceJob.replyTo } });
+      expect(sentMessageIds.slice(messages, sends).every(id => deletedMessageIds.has(id))).toBe(true);
+      expect(earlierIds.every(id => !deletedMessageIds.has(id))).toBe(true);
+    } finally { nextTelegramId = undefined; await mf.dispose(); mf = previous; }
+  }, 15_000);
+
+  it.each([false, true])("does not clear history or regenerate after a failed Telegram deletion (uncertain=%s)", async uncertain => {
+    const previous = mf;
+    mf = await runtime("TestAgent", `retry-delete-failure-${uncertain}`);
+    nextTelegramId = 100_000; incomingMessageIds.clear(); deletedMessageIds.clear();
+    try {
+      const source = await telegram(1, "retry-source");
+      expect((await waitJob(source.body.id)).status).toBe("complete");
+      const before = (await probe("/test/context")).body;
+      rejectDeleteOnce = !uncertain; ambiguousDeleteOnce = uncertain;
+      const queued = await telegram(2, "/retry");
+      const failed = await waitJob(queued.body.id);
+      expect(failed).toMatchObject({ status: "failed", error: "retry_cleanup_failed" });
+      expect(failed.retry).toBeUndefined(); expect(failed.submissionId).toBeUndefined();
+      expect((await probe("/test/context")).body.context).toEqual(before.context);
+      const repeated = await telegram(3, "/retry");
+      expect((await waitJob(repeated.body.id)).status).toBe("complete");
+    } finally { nextTelegramId = undefined; rejectDeleteOnce = false; ambiguousDeleteOnce = false; await mf.dispose(); mf = previous; }
+  });
+
+  it("removes a later compaction from retry context, preserves files, and cannot retry a discarded session", async () => {
+    const previous = mf;
+    mf = await runtime("TestAgent", "retry-compaction");
+    nextTelegramId = 100_000; incomingMessageIds.clear(); deletedMessageIds.clear();
+    try {
+      const memory = (await probe("/test/memory/file?path=MEMORY.md", "PUT", { content: "保留记忆" })).body;
+      const earlier = await telegram(1, "earlier-turn"); await waitJob(earlier.body.id);
+      const source = await telegram(2, "retry-source"); await waitJob(source.body.id);
+      const before = (await probe("/test/context")).body;
+      const input = before.entries.find((entry: any) => entry.kind === "pi.user");
+      const compact = await telegram(3, "/compact");
+      expect((await waitJob(compact.body.id)).status).toBe("complete");
+      const retry = await telegram(4, "/retry");
+      expect((await waitJob(retry.body.id)).status).toBe("complete");
+      const after = (await probe("/test/context")).body;
+      expect(after.context.head).toBeUndefined();
+      expect(after.entries.filter((entry: any) => entry.id <= input.id)).toEqual(before.entries.filter((entry: any) => entry.id <= input.id));
+      expect(JSON.stringify(after.context.messages)).not.toContain("测试压缩摘要");
+      expect((await probe("/test/memory/file?path=MEMORY.md")).body).toEqual(memory);
+      const reset = await telegram(5, "/new"); await waitJob(reset.body.id);
+      const noHistory = await telegram(6, "/retry");
+      expect(await waitJob(noHistory.body.id)).toMatchObject({ status: "complete", parts: ["当前没有可重试的用户消息。"] });
+      expect((await probe("/test/context")).body.context.messages).toEqual([]);
+    } finally { nextTelegramId = undefined; await mf.dispose(); mf = previous; }
+  });
+
+  it("deletes a prior voice message and explicitly regenerates it for /retry", async () => {
+    const previous = mf;
+    mf = await runtime("TestAgent", "retry-speech");
+    nextTelegramId = 100_000; incomingMessageIds.clear(); deletedMessageIds.clear();
+    try {
+      const before = speechCalls;
+      const source = await telegram(1, "speak");
+      const original = await waitJob(source.body.id);
+      expect(original.speech.status).toBe("sent");
+      const retry = await telegram(2, "/retry");
+      const result = await waitJob(retry.body.id);
+      expect(result).toMatchObject({ status: "complete", speech: { status: "sent" } });
+      expect(deletedMessageIds.has(original.speech.messageId)).toBe(true);
+      expect(result.speech.messageId).not.toBe(original.speech.messageId);
+      expect(deletedMessageIds.has(result.speech.messageId)).toBe(false);
+      expect(voices.at(-1)?.replyTo).toBe(original.replyTo);
+      expect(speechCalls).toBe(before + 2);
+    } finally { nextTelegramId = undefined; await mf.dispose(); mf = previous; }
+  });
+
+  it("rolls back history cleanup when its checkpoint fails, without regenerating", async () => {
+    const previous = mf;
+    mf = await runtime("TestAgent", "retry-checkpoint-failure");
+    nextTelegramId = 100_000; incomingMessageIds.clear(); deletedMessageIds.clear();
+    try {
+      const source = await telegram(1, "retry-source"); await waitJob(source.body.id);
+      const before = (await probe("/test/context")).body;
+      await probe("/test/session?retry", "PUT");
+      const retry = await telegram(2, "/retry");
+      const result = await waitJob(retry.body.id);
+      expect(result).toMatchObject({ status: "failed", error: "retry_cleanup_failed" });
+      expect(result.retry).toBeUndefined();
+      expect(result.submissionId).toBeUndefined();
+      expect((await probe("/test/context")).body.context).toEqual(before.context);
+      await probe("/test/session?retry", "DELETE");
+      const again = await telegram(3, "/retry");
+      expect((await waitJob(again.body.id)).status).toBe("complete");
+    } finally { nextTelegramId = undefined; await mf.dispose(); mf = previous; }
+  });
+
+  it("retries the latest received input even if it failed before entering Pi history", async () => {
+    const previous = mf;
+    mf = await runtime("FailSecondAgent", "retry-unplaced-input");
+    nextTelegramId = 100_000; incomingMessageIds.clear(); deletedMessageIds.clear();
+    try {
+      const earlier = await telegram(1, "earlier-user-input");
+      expect((await waitJob(earlier.body.id)).status).toBe("complete");
+      const earlierId = sentMessageIds.at(-1)!;
+      const source = await telegram(2, "latest-unplaced-input");
+      expect(await waitJob(source.body.id)).toMatchObject({ status: "failed", parts: ["simulated model configuration failure"] });
+      const oldErrorId = sentMessageIds.at(-1)!;
+      const retry = await telegram(3, "/retry");
+      expect(await waitJob(retry.body.id)).toMatchObject({ status: "complete", retry: { input: "latest-unplaced-input" } });
+      expect(deletedMessageIds.has(oldErrorId)).toBe(true);
+      expect(deletedMessageIds.has(earlierId)).toBe(false);
+      const again = await telegram(4, "/retry");
+      expect((await waitJob(again.body.id)).status).toBe("complete");
+      const context = (await probe("/test/context")).body.context.messages;
+      expect(context.filter((message: any) => message.role === "user").map((message: any) => message.content)).toEqual(["earlier-user-input", "latest-unplaced-input"]);
+    } finally { nextTelegramId = undefined; await mf.dispose(); mf = previous; }
+  });
+
+  it.each(["length-text", "failed-text"])("cleans the previous %s reply before regenerating", async input => {
+    const previous = mf;
+    mf = await runtime("TestAgent", `retry-${input}`);
+    nextTelegramId = 100_000; incomingMessageIds.clear(); deletedMessageIds.clear();
+    try {
+      const before = sentMessageIds.length;
+      const source = await telegram(1, input); await waitJob(source.body.id);
+      const oldIds = sentMessageIds.slice(before);
+      const retry = await telegram(2, "/retry");
+      const result = await waitJob(retry.body.id);
+      expect(result.retry.entry).toEqual(expect.any(Number));
+      expect(result.status).toBe(input === "length-text" ? "complete" : "failed");
+      expect(oldIds.every(id => deletedMessageIds.has(id))).toBe(true);
+      expect(sentMessageIds.length).toBeGreaterThan(before + oldIds.length);
+      if (input === "length-text") expect(received.at(-2)?.text).toBe('(stopReason: "length")');
+      const context = (await probe("/test/context")).body.context.messages;
+      expect(context.filter((message: any) => message.role === "user" && message.content === input)).toHaveLength(1);
+    } finally { nextTelegramId = undefined; await mf.dispose(); mf = previous; }
+  });
+
+  it("does not regenerate an uncertain voice send whose message ID is unknown", async () => {
+    const previous = mf;
+    mf = await runtime("TestAgent", "retry-uncertain-speech");
+    nextTelegramId = 100_000; incomingMessageIds.clear(); deletedMessageIds.clear();
+    try {
+      ambiguousVoiceOnce = true;
+      const source = await telegram(1, "speak");
+      expect(await waitJob(source.body.id)).toMatchObject({ speech: { status: "uncertain" } });
+      const before = (await probe("/test/context")).body.context;
+      const calls = speechCalls;
+      const retry = await telegram(2, "/retry");
+      expect(await waitJob(retry.body.id)).toMatchObject({ status: "failed", error: "retry_cleanup_failed", parts: [expect.stringContaining("发送回执不完整")] });
+      expect(speechCalls).toBe(calls);
+      expect((await probe("/test/context")).body.context).toEqual(before);
+    } finally { nextTelegramId = undefined; ambiguousVoiceOnce = false; await mf.dispose(); mf = previous; }
+  });
+
+  it("still retries the retained session after /new fails to clear it", async () => {
+    const previous = mf;
+    mf = await runtime("TestAgent", "retry-after-failed-new");
+    nextTelegramId = 100_000; incomingMessageIds.clear(); deletedMessageIds.clear();
+    try {
+      const source = await telegram(1, "retry-source"); await waitJob(source.body.id);
+      await probe("/test/session", "PUT");
+      const reset = await telegram(2, "/new");
+      expect(await waitJob(reset.body.id)).toMatchObject({ status: "failed", error: "session_reset_failed" });
+      await probe("/test/session", "DELETE");
+      const retry = await telegram(3, "/retry");
+      expect(await waitJob(retry.body.id)).toMatchObject({ status: "complete", retry: { entry: expect.any(Number) } });
+    } finally { nextTelegramId = undefined; await mf.dispose(); mf = previous; }
+  });
+
+  it("keeps messages after queued /retry out of the original sleeping turn", async () => {
+    const previous = mf;
+    mf = await runtime("TestAgent", "retry-steering");
+    nextTelegramId = 100_000; incomingMessageIds.clear(); deletedMessageIds.clear();
+    try {
+      const count = received.length;
+      const source = await telegram(1, "intermediate-text");
+      await waitMessages(count + 4);
+      const original = (await probe("/test/context")).body.entries.find((entry: any) => entry.kind === "pi.user");
+      const retry = await telegram(2, "/retry");
+      const next = await telegram(3, "later-user-input");
+      expect((await waitJob(source.body.id)).status).toBe("complete");
+      expect(await waitJob(retry.body.id)).toMatchObject({ status: "complete", retry: { entry: original.id } });
+      expect((await waitJob(next.body.id)).status).toBe("complete");
+      const context = (await probe("/test/context")).body.context.messages;
+      expect(context.filter((message: any) => message.role === "user" && message.content === "later-user-input")).toHaveLength(1);
+    } finally { nextTelegramId = undefined; await mf.dispose(); mf = previous; }
   }, 10_000);
 
   it("runs Web Access through Pi Durable without external calls", async () => {
@@ -684,7 +1000,7 @@ describe.sequential("real local Workers / SQLite Durable Object (no R2 binding)"
     expect(speechCalls).toBe(generated + 1);
   });
 
-  it("lets Pi send, sleep and receive an awake reply in one conversation without wakeup hooks", async () => {
+  it("lets Pi send, sleep and receive an awake reply in one conversation", async () => {
     const previous = mf;
     const scheduled = await runtime("TestAgent", "scheduled");
     mf = scheduled;
@@ -712,22 +1028,13 @@ describe.sequential("real local Workers / SQLite Durable Object (no R2 binding)"
       expect((await waitJob(owner.body.id)).status).toBe("complete");
       expect(received.length).toBe(before + 3);
       expect(received.at(-1)?.text).toBe("已停止提醒。");
-      expect((await probe("/test/wakeup")).body).toEqual({ active: false });
       expect((await worker.scheduled(event)).outcome).toBe("ok");
       expect(received.length).toBe(before + 3);
       const context = (await probe("/test/context")).body.context;
       expect(JSON.stringify(context)).toContain("我醒了");
       expect(JSON.stringify(context)).toContain("起床啦，开始新的一天。");
       expect(JSON.stringify(context)).toContain("sleep 1");
-      expect(JSON.stringify(context)).not.toContain("telegram_send");
     } finally { mf = previous; await scheduled.dispose(); }
-  });
-
-  it("keeps legacy wakeup prompts free of audio-generation requirements", async () => {
-    for (const name of ["start", "nudge"]) {
-      const prompt = await fs.readFile(new URL(`../../.github/prompts/telegram-wakeup-${name}.md`, import.meta.url), "utf8");
-      expect(prompt).not.toMatch(/\b(?:tts|voice|audio|speech)\b|语音/i);
-    }
   });
 
   it("resumes a sleeping Pi conversation after restart without replaying an intermediate send", async () => {
@@ -784,7 +1091,8 @@ describe.sequential("real local Workers / SQLite Durable Object (no R2 binding)"
     mf = production;
     try {
       await probe("/test/context", "PUT", ["已有会话历史必须保留"]);
-      await probe("/test/context", "PATCH", { identity: "legacy-removed-identity", web_safety: "legacy-removed-web_safety", telegram_speech: "legacy-removed-telegram_speech" });
+      await probe("/test/context", "POST", ["已有助手消息必须保留"]);
+      await probe("/test/context", "PATCH", { identity: "legacy-removed-identity", web_safety: "legacy-removed-web_safety", telegram_speech: "legacy-removed-telegram_speech", current_time: "legacy-removed-current_time", hermes_memory: "legacy-removed-hermes_memory", bash: "legacy-removed-bash" });
       const before = outbound.length;
       const messages = received.length;
       const queued = await telegram(1, "只需回答一句话");

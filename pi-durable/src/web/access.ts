@@ -78,6 +78,8 @@ export function extractHtml(html: string, maxChars = MAX_TEXT_CHARS): { title: s
 export class WebAccess {
   constructor(private readonly env: Pick<Env, "WEB_ALLOWED_HOSTS" | "WEB_SEARCH_PROVIDER" | "EXA_API_KEY" | "BRAVE_SEARCH_API_KEY" | "TAVILY_API_KEY">, private readonly fetcher: Fetcher = fetch.bind(globalThis)) {}
 
+  get provider(): string { return this.env.WEB_SEARCH_PROVIDER ?? "brave"; }
+
   private async resolvePublic(url: URL, signal: AbortSignal): Promise<void> {
     const host = url.hostname.replace(/^\[|\]$/g, "").replace(/\.$/, "");
     if (ipaddr.isValid(host)) return;
@@ -138,38 +140,41 @@ export class WebAccess {
     }
   };
 
-  async read(input: string): Promise<{ url: string; title: string; text: string; truncated: boolean }> {
-    const response = await this.request(input, { headers: { accept: "text/html,text/plain,application/json;q=0.9", "user-agent": "PiDurableAgent/0.1" } });
+  async read(input: string, options: { mode?: "readable" | "raw"; signal?: AbortSignal } = {}): Promise<{ url: string; title: string; text: string; truncated: boolean }> {
+    const response = await this.request(input, { headers: { accept: "text/html,text/plain,application/json;q=0.9", "user-agent": "PiDurableAgent/0.1" }, signal: options.signal });
     if (response.status < 200 || response.status >= 300) throw new HttpError(502, `Web page returned HTTP ${response.status}`);
     const type = response.headers["content-type"]?.split(";")[0]?.trim().toLowerCase() ?? "";
     if (!["text/html", "application/xhtml+xml", "text/plain", "text/markdown", "application/json"].includes(type)) throw new HttpError(415, "Only HTML and text/JSON pages are supported");
     const body = new TextDecoder().decode(response.body);
-    if (type.includes("html")) return { url: response.url, ...extractHtml(body) };
+    if (options.mode !== "raw" && type.includes("html")) return { url: response.url, ...extractHtml(body) };
     return { url: response.url, title: "", text: body.slice(0, MAX_TEXT_CHARS), truncated: body.length > MAX_TEXT_CHARS };
   }
 
-  async search(query: string, count = 5): Promise<{ title: string; url: string; description: string }[]> {
+  async search(query: string, numResults = 5, options: { provider?: string; signal?: AbortSignal } = {}): Promise<{ title: string; url: string; description: string }[]> {
     if (!query.trim() || query.length > 300) throw new HttpError(400, "Invalid search query");
-    count = Math.max(1, Math.min(10, count));
-    const provider = this.env.WEB_SEARCH_PROVIDER ?? "brave";
+    if (!Number.isInteger(numResults)) throw new HttpError(400, "Invalid result count");
+    numResults = Math.max(1, Math.min(20, numResults));
+    const provider = options.provider ?? this.provider;
+    const signal = AbortSignal.any([AbortSignal.timeout(15_000), ...(options.signal ? [options.signal] : [])]);
+    signal.throwIfAborted();
     let response: Response;
     if (provider === "brave") {
       if (!this.env.BRAVE_SEARCH_API_KEY) throw new HttpError(503, "Missing BRAVE_SEARCH_API_KEY Secret");
       const url = new URL("https://api.search.brave.com/res/v1/web/search");
       url.searchParams.set("q", query);
-      url.searchParams.set("count", String(count));
-      response = await this.fetcher(url, { headers: { "X-Subscription-Token": this.env.BRAVE_SEARCH_API_KEY, accept: "application/json" }, signal: AbortSignal.timeout(15_000), redirect: "manual" });
+      url.searchParams.set("count", String(numResults));
+      response = await this.fetcher(url, { headers: { "X-Subscription-Token": this.env.BRAVE_SEARCH_API_KEY, accept: "application/json" }, signal, redirect: "manual" });
     } else if (provider === "tavily") {
       if (!this.env.TAVILY_API_KEY) throw new HttpError(503, "Missing TAVILY_API_KEY Secret");
       response = await this.fetcher("https://api.tavily.com/search", {
-        method: "POST", headers: { "content-type": "application/json" }, redirect: "manual", signal: AbortSignal.timeout(15_000),
-        body: JSON.stringify({ api_key: this.env.TAVILY_API_KEY, query, max_results: count, include_raw_content: false }),
+        method: "POST", headers: { "content-type": "application/json" }, redirect: "manual", signal,
+        body: JSON.stringify({ api_key: this.env.TAVILY_API_KEY, query, max_results: numResults, include_raw_content: false }),
       });
     } else if (provider === "exa") {
       if (!this.env.EXA_API_KEY?.trim()) throw new HttpError(503, "Missing EXA_API_KEY Secret");
       response = await this.fetcher("https://api.exa.ai/search", {
-        method: "POST", headers: { "content-type": "application/json", "x-api-key": this.env.EXA_API_KEY }, redirect: "manual", signal: AbortSignal.timeout(15_000),
-        body: JSON.stringify({ query, type: "auto", numResults: count, contents: { highlights: { maxCharacters: 2_000 } } }),
+        method: "POST", headers: { "content-type": "application/json", "x-api-key": this.env.EXA_API_KEY }, redirect: "manual", signal,
+        body: JSON.stringify({ query, type: "auto", numResults, contents: { highlights: { maxCharacters: 2_000 } } }),
       });
     } else { throw new HttpError(503, "WEB_SEARCH_PROVIDER must be brave, tavily or exa"); }
     if (!response.ok) { await response.body?.cancel(); throw new HttpError(502, `Search provider returned HTTP ${response.status}`); }
@@ -183,6 +188,6 @@ export class WebAccess {
       try { url = publicUrl(entry.url, this.env.WEB_ALLOWED_HOSTS); } catch { return []; }
       const highlights = Array.isArray(entry.highlights) ? entry.highlights.filter(value => typeof value === "string").join("\n") : "";
       return [{ title: String(entry.title ?? "").slice(0, 500), url: url.href, description: String(entry.description ?? entry.content ?? (highlights || entry.text) ?? "").slice(0, 2_000) }];
-    }).slice(0, count);
+    }).slice(0, numResults);
   }
 }

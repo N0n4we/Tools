@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Make 30 MQTT 3.1.1 connections with a wrong password in under one minute."""
 
+import argparse
 import collections
 import datetime
 import json
@@ -111,7 +112,9 @@ def probe(host, ip, port, username, context):
 
 
 def main():
-    host, port, username = load_config(Path(__file__).with_name("env"))
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, required=True, help="Path to an explicitly selected local configuration")
+    host, port, username = load_config(parser.parse_args().config)
     addresses = sorted({entry[4][0] for entry in socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)})
     context = ssl.create_default_context()
     print(json.dumps({"event": "start", "started_at": utc_now(), "host": host,

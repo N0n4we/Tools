@@ -40,8 +40,13 @@ export type TelegramFormat = "rich" | "html";
 const escapeHtml = (text: string) => text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 const literalEvidence = (text: string) => escapeHtml(text.replace(/\b(https?:\/\/)(?=\S)/gi, "$1\u200b"));
 
+export function stripTimePrefix(text: string): string {
+  // shortcut: only bare leading metadata labels are removed; revise if the metadata envelope changes.
+  return text.replace(/^(?:\s*\[\d{4}-\d{2}-\d{2} \d{2}[:-]\d{2}[:-]\d{2}\][ \t]*(?:\r?\n)?)+/, "");
+}
+
 export function activityEvidence(text: string, tail = false): string {
-  const redacted = text
+  const redacted = stripTimePrefix(text)
     .replace(/\b\d{8,12}:[A-Za-z0-9_-]{30,}\b/g, "[REDACTED_BOT_TOKEN]")
     .replace(/\b(Bearer\s+)[A-Za-z0-9._~+/=-]{16,}\b/gi, "$1[REDACTED]")
     .replace(/(["']?(?:api[_-]?key|token|password|secret)["']?\s*[:=]\s*["']?)[^"',\s}]+/gi, "$1[REDACTED]");
@@ -108,6 +113,12 @@ export class TelegramBot {
     }, signal);
     if (!Number.isSafeInteger(result?.message_id)) throw new TelegramError(30, false, true);
     return result.message_id!;
+  }
+
+  async deleteMessages(chatId: number, messageIds: number[], signal?: AbortSignal): Promise<void> {
+    if (!messageIds.length || messageIds.length > 100 || messageIds.some(id => !Number.isSafeInteger(id) || id < 1)) throw new HttpError(400, "Expected 1–100 Telegram message IDs");
+    const result = await this.call<true>("deleteMessages", { chat_id: chatId, message_ids: messageIds }, signal);
+    if (result !== true) throw new TelegramError(0, false, true);
   }
 
   async publish(chatId: number, view: TelegramView, replyTo?: number, signal?: AbortSignal, messageId?: number, format: TelegramFormat = "rich"): Promise<{ messageId: number; format: TelegramFormat }> {
