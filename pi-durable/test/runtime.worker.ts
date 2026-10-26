@@ -85,6 +85,16 @@ export class ProbeAgent extends AgentBackend {
         }
         return Response.json({ present: sql.exec("SELECT 1 FROM sqlite_master WHERE name = 'hermes_text_files'").toArray().length > 0 });
       }
+      if (url.pathname === "/test/archives") {
+        const sql = this.ctx.storage.sql;
+        if (request.method === "PUT") sql.exec(`CREATE TRIGGER test_archive_failure BEFORE INSERT ON files
+          WHEN NEW.path GLOB '/hermes/123/archives/*/context.json.part-000001'
+          BEGIN SELECT RAISE(ABORT, 'simulated archive failure'); END`);
+        if (request.method === "DELETE") sql.exec("DROP TRIGGER test_archive_failure");
+        return Response.json(sql.exec<{ path: string; bytes: number; etag: string }>(
+          "SELECT path, size AS bytes, etag FROM files WHERE path GLOB '/hermes/123/archives/*' AND is_dir = 0 ORDER BY path",
+        ).toArray().map(file => ({ ...file, content: this.readFile(file.path).content })));
+      }
       if (url.pathname === "/test/memory/file") {
         const path = validatePath(url.searchParams.get("path")!);
         const absolute = `/hermes/123/${path}`;

@@ -8,7 +8,7 @@ import { ownerId } from "./env.js";
 import { HttpError, errorResponse, jsonBody, textField } from "./http.js";
 import { MemoryStore } from "./memory/store.js";
 import { agentExtension } from "./pi/extension.js";
-import { agentInput, discardAgentReplies, discardAgentSession, openAgentStorage } from "./pi/storage.js";
+import { agentInput, archiveAgentSession, discardAgentReplies, discardAgentSession, openAgentStorage } from "./pi/storage.js";
 import { openRouterModels, type AgentModels } from "./pi/models.js";
 import { TelegramError } from "./telegram.js";
 import { TelegramOutput, replyParts, type TextDelivery } from "./telegram-output.js";
@@ -32,6 +32,7 @@ export interface Job extends TextDelivery {
   createdAt: number;
   submissionId?: number;
   compactionTaskId?: TaskId<CompactionResult>;
+  archivePath?: string;
   outputAfter?: EntryId | null;
   retry?: { entry?: EntryId; input?: string; replyTo: number };
 }
@@ -205,7 +206,7 @@ export class AgentBackend extends AgentFiles {
     if (job.kind === "new") {
       await this.ctx.storage.transaction(async storage => {
         discardAgentSession(this.ctx.storage.sql);
-        job.parts = ["已开始新会话，旧会话记录已丢弃；记忆和 Skill 文件已保留。"];
+        job.parts = ["已开始新会话，旧会话已归档；记忆和 Skill 文件已保留。"];
         job.status = "ready";
         await storage.put(`job:${job.id}`, job);
       });
@@ -368,6 +369,18 @@ export class AgentBackend extends AgentFiles {
       job.status = "running";
       await this.ctx.storage.put(`job:${job.id}`, job);
       try {
+        if ((job.kind === "compact" || job.kind === "new" || job.kind === "retry") && job.archivePath === undefined) {
+          const archivePath = `/${this.memory.prefix}archives/${job.createdAt}-${job.kind}-${job.id}`;
+          try {
+            await this.ctx.storage.transaction(async storage => {
+              archiveAgentSession(this.ctx.storage.sql, this, archivePath);
+              await storage.put(`job:${job.id}`, { ...job, archivePath });
+            });
+          } catch (error) {
+            throw new HttpError(500, `历史上下文归档失败，未执行 /${job.kind}：${error instanceof Error ? error.message : String(error)}`);
+          }
+          job.archivePath = archivePath;
+        }
         if (job.kind !== "retry" || job.retry || await this.prepareRetry(job, output)) await this.answer(job, output);
       }
       catch (error) {

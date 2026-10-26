@@ -11,6 +11,7 @@ import { bashExtension } from "../src/bash/extension.js";
 import { MAX_FILE_BYTES, MemoryStore } from "../src/memory/store.js";
 import { installSpeechSkill } from "../src/speech/skill.js";
 import { MAX_WEB_BYTES, WebAccess } from "../src/web/access.js";
+import { archiveAgentSession } from "../src/pi/storage.js";
 
 function fixture(web = new WebAccess({}, vi.fn(async () => { throw new Error("Unexpected network request"); }) as unknown as typeof fetch)) {
   const { storage, files, database } = memoryDatabase();
@@ -40,6 +41,36 @@ function legacyTable(database: ReturnType<typeof memoryDatabase>["database"]) {
 }
 
 describe("durable-bash filesystem and Pi tool", () => {
+  it("archives an uninitialized session as an empty array", () => {
+    const { storage, files } = fixture();
+    const directory = "/hermes/123/archives/empty";
+    storage.transactionSync(() => archiveAgentSession(storage.sql, files, directory));
+    expect(files.readFile(`${directory}/context.json.part-000000`).content).toBe("[]\n");
+  });
+
+  it("archives every record in bounded UTF-8 parts readable through bash without overwriting archives", async () => {
+    const { storage, files, database, run, output, store } = fixture();
+    database.exec("CREATE TABLE entries (id INTEGER PRIMARY KEY, record TEXT NOT NULL)");
+    const entries = Array.from({ length: 1001 }, (_, id) => ({ id, kind: "pi.user", model: [{ role: "user", content: id === 0 ? "中😀\n".repeat(60_000) : `fact-${id}` }] }));
+    const insert = database.prepare("INSERT INTO entries VALUES (?, ?)");
+    for (const entry of entries.toReversed()) insert.run(entry.id, JSON.stringify(entry));
+    const directory = "/hermes/123/archives/large";
+    storage.transactionSync(() => archiveAgentSession(storage.sql, files, directory));
+    const paths = files.readdir(directory).sort().map(name => `${directory}/${name}`);
+    expect(paths.length).toBeGreaterThan(1);
+    const parts = paths.map(path => {
+      const bytes = files.readFileBuffer(path).content;
+      expect(bytes.byteLength).toBeLessThanOrEqual(MAX_FILE_BYTES);
+      return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    });
+    expect(JSON.parse(parts.join(""))).toEqual(entries);
+    await run("cat archives/large/context.json.part-* | jq length");
+    expect(output.at(-1)).toBe("1001\n");
+    expect(await store.promptContext()).toBe("");
+    expect(() => storage.transactionSync(() => archiveAgentSession(storage.sql, files, directory))).toThrow("EEXIST");
+    expect(paths.map(path => files.readFile(path).content)).toEqual(parts);
+  });
+
   it("uses Pi CLI's bash description and parameter descriptions", () => {
     const { tool } = fixture();
     expect(tool.description).toBe("Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds.");

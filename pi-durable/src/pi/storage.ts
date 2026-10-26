@@ -1,4 +1,6 @@
 import { ROOT_CONVERSATION_ID, type EntryId } from "@earendil-works/pi-durable";
+import type { FsObject } from "@stablemodels/durable-bash/object";
+import { MAX_FILE_BYTES } from "../memory/store.js";
 
 export { openDurableObjectSqliteStorage as openAgentStorage } from "@earendil-works/pi-durable/storage/sqlite/cloudflare";
 
@@ -8,6 +10,21 @@ export function discardAgentSession(sql: SqlStorage): void {
   for (const { name } of sql.exec<{ name: string }>(`SELECT name FROM sqlite_master WHERE type = 'table' AND name IN
     ('record_ids', 'conversations', 'entries', 'tasks', 'submissions', 'documents', 'document_revisions')`).toArray()) {
     sql.exec(`DELETE FROM "${name}"`);
+  }
+}
+
+// The caller checkpoints the archive with its job before changing the session.
+export function archiveAgentSession(sql: SqlStorage, files: Pick<FsObject, "mkdir" | "writeFile">, directory: string): void {
+  const entries = sql.exec("SELECT 1 FROM sqlite_master WHERE name = 'entries' AND type = 'table'").toArray().length
+    ? sql.exec<{ record: string }>("SELECT record FROM entries ORDER BY id").toArray() : [];
+  const bytes = new TextEncoder().encode(`[${entries.map(entry => entry.record).join(",")}]\n`);
+  files.mkdir(directory.slice(0, directory.lastIndexOf("/")), { recursive: true });
+  files.mkdir(directory);
+  for (let start = 0, part = 0; start < bytes.length; part++) {
+    let end = Math.min(start + MAX_FILE_BYTES, bytes.length);
+    while (end < bytes.length && (bytes[end]! & 0xc0) === 0x80) end--;
+    files.writeFile(`${directory}/context.json.part-${String(part).padStart(6, "0")}`, bytes.subarray(start, end));
+    start = end;
   }
 }
 

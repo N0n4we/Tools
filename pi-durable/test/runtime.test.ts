@@ -285,7 +285,8 @@ describe.sequential("real local Workers / SQLite Durable Object (no R2 binding)"
     const previous = mf;
     mf = await runtime("TestAgent", `compact-${name}-history`);
     try {
-      expect((await probe("/test/context", "PUT", history)).status).toBe(200);
+      const original = await probe("/test/context", "PUT", history);
+      expect(original.status).toBe(200);
       const memory = (await probe("/test/memory/file?path=MEMORY.md", "PUT", { content: "保留长期记忆" })).body;
       const before = received.length;
       rejectOnce = true;
@@ -294,6 +295,9 @@ describe.sequential("real local Workers / SQLite Durable Object (no R2 binding)"
       expect(duplicate.body.id).toBe(queued.body.id);
       const job = await waitJob(queued.body.id);
       expect(job).toMatchObject({ kind: "compact", status: "complete", parts: ["上下文已压缩，历史记录和记忆文件已保留。"] });
+      const archive = (await probe("/test/archives")).body;
+      expect(archive[0].path).toBe(`${job.archivePath}/context.json.part-000000`);
+      expect(JSON.parse(archive.map((file: any) => file.content).join(""))).toEqual(original.body.entries.toReversed());
       expect(received.length).toBe(before + 1);
       expect(received.at(-1)).toMatchObject({ chat_id: 123, reply_parameters: { message_id: 2 } });
       const view = (await probe("/test/context")).body;
@@ -319,6 +323,7 @@ describe.sequential("real local Workers / SQLite Durable Object (no R2 binding)"
       const recovered = await telegram(1, "/compact");
       expect(await waitJob(recovered.body.id)).toMatchObject({ status: "complete", compactionTaskId: job.compactionTaskId, parts: job.parts });
       expect((await probe("/test/context")).body).toEqual(reopened);
+      expect((await probe("/test/archives")).body).toEqual(archive);
       expect(received.length).toBe(before + 2);
       const normal = await telegram(2, "hello");
       expect((await waitJob(normal.body.id)).status).toBe("complete");
@@ -350,7 +355,7 @@ describe.sequential("real local Workers / SQLite Durable Object (no R2 binding)"
       const before = outbound.length;
       const queued = await telegram(1, " /new\n");
       const job = await waitJob(queued.body.id);
-      expect(job).toMatchObject({ kind: "new", status: "complete", parts: ["已开始新会话，旧会话记录已丢弃；记忆和 Skill 文件已保留。"] });
+      expect(job).toMatchObject({ kind: "new", status: "complete", parts: ["已开始新会话，旧会话已归档；记忆和 Skill 文件已保留。"] });
       expect(job.submissionId).toBeUndefined();
       expect(job.compactionTaskId).toBeUndefined();
       expect(job.speech).toBeUndefined();
@@ -389,6 +394,9 @@ describe.sequential("real local Workers / SQLite Durable Object (no R2 binding)"
         await new Promise(resolve => setTimeout(resolve, 10));
       }
       expect(checkpoint).toMatchObject({ kind: "new", status: "ready", retryAt: expect.any(Number) });
+      const archive = (await probe("/test/archives")).body;
+      expect(archive[0].path).toBe(`${checkpoint.archivePath}/context.json.part-000000`);
+      expect(JSON.parse(archive.map((file: any) => file.content).join(""))).toEqual(original.entries.toReversed());
       expect((await probe("/test/session")).body).toEqual({ record_ids: 0, conversations: 0, entries: 0, tasks: 0, submissions: 0, documents: 0, document_revisions: 0 });
       const empty = (await probe("/test/context")).body;
       expect(empty.context.messages).toEqual([]);
@@ -407,6 +415,7 @@ describe.sequential("real local Workers / SQLite Durable Object (no R2 binding)"
       expect((await waitJob(oldReplay.body.id)).status).toBe("complete");
       expect(received.length).toBe(before + 1);
       expect((await probe("/test/context")).body).toEqual(newView);
+      expect((await probe("/test/archives")).body).toEqual(archive);
       expect((await probe("/test/memory/file?path=MEMORY.md")).body).toEqual(memory);
       expect((await probe("/test/memory/file?path=skills/test/SKILL.md")).body).toEqual(skill);
       expect(outbound.slice(calls).every(host => host === "api.telegram.org")).toBe(true);
@@ -459,7 +468,7 @@ describe.sequential("real local Workers / SQLite Durable Object (no R2 binding)"
       expect(JSON.stringify(view.context.messages)).toContain("hello-after-new");
       expect(JSON.stringify(view.entries)).not.toContain("定时文字叫醒");
       expect(JSON.stringify(view.entries)).not.toContain("/new");
-      expect(received.slice(before).map(message => message.text)).toEqual([...wakeupAssistant, "本地工具执行完成。", "已开始新会话，旧会话记录已丢弃；记忆和 Skill 文件已保留。", "本地测试回答。"]);
+      expect(received.slice(before).map(message => message.text)).toEqual([...wakeupAssistant, "本地工具执行完成。", "已开始新会话，旧会话已归档；记忆和 Skill 文件已保留。", "本地测试回答。"]);
     } finally { await mf.dispose(); mf = previous; }
   }, 10_000);
 
@@ -501,6 +510,9 @@ describe.sequential("real local Workers / SQLite Durable Object (no R2 binding)"
       expect(duplicate.body.id).toBe(queued.body.id);
       const retried = await waitJob(queued.body.id);
       expect(retried).toMatchObject({ kind: "retry", status: "complete", retry: { entry: input.id, replyTo: sourceJob.replyTo }, submissionId: expect.any(Number) });
+      const archive = (await probe("/test/archives")).body;
+      expect(archive[0].path).toBe(`${retried.archivePath}/context.json.part-000000`);
+      expect(JSON.parse(archive.map((file: any) => file.content).join(""))).toEqual(before.entries.toReversed());
       expect(deletedMessageIds).toEqual(new Set(oldIds));
       expect(earlierIds.every(id => !deletedMessageIds.has(id))).toBe(true);
       const after = (await probe("/test/context")).body;
@@ -521,12 +533,41 @@ describe.sequential("real local Workers / SQLite Durable Object (no R2 binding)"
       expect((await waitJob(queued.body.id)).status).toBe("complete");
       expect(telegramCalls).toHaveLength(calls);
       expect(sentMessageIds).toHaveLength(sends);
+      expect((await probe("/test/archives")).body).toEqual(archive);
       const again = await telegram(4, "/retry");
       expect(await waitJob(again.body.id)).toMatchObject({ status: "complete", retry: { entry: input.id, replyTo: sourceJob.replyTo } });
       expect(sentMessageIds.slice(messages, sends).every(id => deletedMessageIds.has(id))).toBe(true);
       expect(earlierIds.every(id => !deletedMessageIds.has(id))).toBe(true);
     } finally { nextTelegramId = undefined; await mf.dispose(); mf = previous; }
   }, 15_000);
+
+  it.each(["compact", "new", "retry"])("stops /%s before changing history or deleting replies if archiving fails", async command => {
+    const previous = mf;
+    mf = await runtime("TestAgent", `archive-failure-${command}`);
+    nextTelegramId = 100_000; incomingMessageIds.clear(); deletedMessageIds.clear();
+    try {
+      const source = await telegram(1, "retry-source");
+      expect((await waitJob(source.body.id)).status).toBe("complete");
+      const original = (await probe("/test/context", "POST", ["中😀".repeat(60_000)])).body;
+      expect((await probe("/test/archives", "PUT")).status).toBe(200);
+      const queued = await telegram(2, `/${command}`);
+      const failed = await waitJob(queued.body.id);
+      expect(failed).toMatchObject({ status: "failed", parts: [expect.stringContaining(`历史上下文归档失败，未执行 /${command}`)] });
+      expect(failed.archivePath).toBeUndefined();
+      expect(failed.compactionTaskId).toBeUndefined();
+      expect(failed.retry).toBeUndefined();
+      expect((await probe("/test/context")).body).toEqual(original);
+      expect((await probe("/test/archives")).body).toEqual([]);
+      expect(deletedMessageIds.size).toBe(0);
+      await probe("/test/archives", "DELETE");
+      const again = await telegram(3, `/${command}`);
+      expect((await waitJob(again.body.id)).status).toBe("complete");
+      const archive = (await probe("/test/archives")).body;
+      expect(archive.length).toBeGreaterThan(1);
+      expect(archive.every((file: any) => file.bytes <= MAX_FILE_BYTES)).toBe(true);
+      expect(JSON.parse(archive.map((file: any) => file.content).join(""))).toEqual(original.entries.toReversed());
+    } finally { nextTelegramId = undefined; await mf.dispose(); mf = previous; }
+  });
 
   it.each([false, true])("does not clear history or regenerate after a failed Telegram deletion (uncertain=%s)", async uncertain => {
     const previous = mf;
