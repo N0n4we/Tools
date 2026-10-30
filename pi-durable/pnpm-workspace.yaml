@@ -5,6 +5,7 @@ allowBuilds:
 minimumReleaseAgeExclude:
   - '@cloudflare/workers-types@5.20261007.1'
 patchedDependencies:
+  '@earendil-works/pi-durable@1.4.0': patches/@earendil-works__pi-durable@1.4.0.patch
   '@stablemodels/durable-bash@0.2.0': patches/@stablemodels__durable-bash@0.2.0.patch
 # Type-only peer: validated against the project's Workers v5 types and workerd.
 peerDependencyRules:

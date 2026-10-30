@@ -122,10 +122,23 @@ export class TestAgent extends ProbeAgent {
         if (input.includes("compaction-failure")) return fauxAssistantMessage("incomplete", { stopReason: "length" });
         return fauxAssistantMessage("测试压缩摘要：保留重要事实和未完成任务。");
       }
+      let previousDate: string | undefined;
+      let pendingDate: string | undefined;
       for (const message of context.messages) {
         if (message.role === "system") continue;
-        const time = new Date(message.timestamp + 8 * 60 * 60_000).toISOString().slice(0, 19).replace("T", " ");
-        const prefix = `[${time}]\n`;
+        const date = new Date(message.timestamp + 8 * 60 * 60_000);
+        const day = date.toISOString().slice(0, 10);
+        const weekday = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"][date.getUTCDay()];
+        if (message.role === "user" && message.content === `[${day} ${weekday}]`) {
+          if (previousDate === undefined || previousDate === day || pendingDate) throw new Error("Unexpected date separator");
+          pendingDate = day;
+          continue;
+        }
+        if (previousDate !== undefined && previousDate !== day && pendingDate !== day) throw new Error("Missing date separator");
+        if (pendingDate && pendingDate !== day) throw new Error("Incorrect date separator");
+        previousDate = day;
+        pendingDate = undefined;
+        const prefix = `[${date.toISOString().slice(11, 19)}]\n`;
         const first = typeof message.content === "string" ? message.content.slice(0, prefix.length) : message.content[0]?.type === "text" ? message.content[0].text : undefined;
         if (first !== prefix) throw new Error(`Missing message timestamp for ${message.role}: ${first}`);
       }
@@ -135,7 +148,7 @@ export class TestAgent extends ProbeAgent {
       const sections = getCurrentSystemMessage(context.messages)?.sections;
       if (input.includes("role-format")) {
         if (!sections?.conversation?.includes("测试角色小岚") || !sections.conversation.includes("动作必须用（）包裹")) throw new Error("Role preferences were not loaded before the first reply");
-        return fauxAssistantMessage(input.includes("second") ? "[2026-10-25 12-03-34]（微笑）第二轮。" : "（轻轻点头）第一轮。");
+        return fauxAssistantMessage(input.includes("second") ? "[2026-10-25 Sunday]\n[12:03:34]（微笑）第二轮。" : "（轻轻点头）第一轮。");
       }
       if (input.includes("定时文字叫醒")) {
         if (!last || Math.abs(Date.now() - last.timestamp) > 120_000) throw new Error("Latest message time is stale");

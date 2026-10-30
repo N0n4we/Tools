@@ -14,9 +14,9 @@
     "files:migrate": "node scripts/migrate-files.mjs"
   },
   "dependencies": {
-    "@earendil-works/chord": "1.3.0",
-    "@earendil-works/pi-ai": "1.3.0",
-    "@earendil-works/pi-durable": "1.3.0",
+    "@earendil-works/chord": "1.4.0",
+    "@earendil-works/pi-ai": "1.4.0",
+    "@earendil-works/pi-durable": "1.4.0",
     "@stablemodels/durable-bash": "0.2.0",
     "htmlparser2": "12.0.0",
     "ipaddr.js": "2.5.0",

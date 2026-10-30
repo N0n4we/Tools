@@ -42,7 +42,7 @@ const literalEvidence = (text: string) => escapeHtml(text.replace(/\b(https?:\/\
 
 export function stripTimePrefix(text: string): string {
   // shortcut: only bare leading metadata labels are removed; revise if the metadata envelope changes.
-  return text.replace(/^(?:\s*\[\d{4}-\d{2}-\d{2} \d{2}[:-]\d{2}[:-]\d{2}\][ \t]*(?:\r?\n)?)+/, "");
+  return text.replace(/^(?:\s*\[(?:(?:\d{4}-\d{2}-\d{2} )?\d{2}[:-]\d{2}[:-]\d{2}|\d{4}-\d{2}-\d{2} (?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday))\][ \t]*(?:\r?\n)?)+/, "");
 }
 
 export function activityEvidence(text: string, tail = false): string {

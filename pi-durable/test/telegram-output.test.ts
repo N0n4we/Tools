@@ -56,7 +56,7 @@ describe("durable Telegram presentation", () => {
     expect(replyParts(`${"x".repeat(4000)}[2026-10-25 12:03:34]正文`)).toEqual(["x".repeat(4000), "[2026-10-25 12:03:34]正文"]);
   });
 
-  it.each(["[2026-10-25 12-03-34]", "[2026-10-25 12:03:34]"])("removes echoed metadata %s without changing role actions, quoted dates or stored history", async prefix => {
+  it.each(["[2026-10-25 12-03-34]", "[2026-10-25 12:03:34]", "[12:03:34]", "[2026-10-25 Sunday]\n[12:03:34]"])("removes echoed metadata %s without changing role actions, quoted dates or stored history", async prefix => {
     const { output, calls, reopen } = fixture();
     const message = fauxAssistantMessage([
       fauxText(`${prefix}\n${prefix}（轻轻点头）你好。`),

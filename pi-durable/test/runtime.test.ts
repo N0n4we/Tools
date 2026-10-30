@@ -1,3 +1,4 @@
+import { stripTimePrefix } from "../src/telegram.js";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -121,7 +122,7 @@ async function runtime(className = "TestAgent", state = "default", script = bund
         expect(system).not.toContain("legacy-removed-");
         expect(system).toContain("telegram-speech");
         for (const message of body.messages.filter(message => ["user", "assistant", "tool"].includes(message.role))) {
-          expect(message.content).toEqual(expect.stringMatching(/^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\]\n/));
+          expect(message.content).toEqual(expect.stringMatching(/^(?:\[\d{2}:\d{2}:\d{2}\]\n|\[\d{4}-\d{2}-\d{2} (?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\]$)/));
         }
         const thinking = { id: "test-completion", object: "chat.completion.chunk", created: 1, model: body.model, choices: [{ index: 0, delta: { role: "assistant", reasoning: "OpenRouter 可见思考。" }, finish_reason: null }] };
         const chunk = { id: "test-completion", object: "chat.completion.chunk", created: 1, model: body.model, choices: [{ index: 0, delta: { role: "assistant", content: "OpenRouter 本地完成。" }, finish_reason: null }] };
@@ -217,7 +218,7 @@ describe.sequential("real local Workers / SQLite Durable Object (no R2 binding)"
     expect((await telegram(42, "different input")).status).toBe(409);
   });
 
-  it("timestamps model messages in Beijing time across midnight without rewriting history or Telegram output", async () => {
+  it("timestamps model messages in Beijing time across midnight in persisted history and archives without changing Telegram output", async () => {
     const previous = mf;
     mf = await runtime("TestAgent", "message-time");
     try {
@@ -229,14 +230,23 @@ describe.sequential("real local Workers / SQLite Durable Object (no R2 binding)"
       const queued = await telegram(1, "remember");
       expect(await waitJob(queued.body.id)).toMatchObject({ status: "complete" });
       const messages = (await probe("/test/context")).body.context.messages.filter((message: { role: string }) => message.role !== "system");
-      expect(messages.slice(0, 2)).toMatchObject([
-        { role: "user", content: "历史用户消息", timestamp: userTime },
-        { role: "assistant", content: [{ type: "text", text: "历史助手消息" }], timestamp: assistantTime },
+      expect(messages.slice(0, 3)).toMatchObject([
+        { role: "user", content: "[23:59:59]\n历史用户消息", timestamp: userTime },
+        { role: "user", content: "[2027-01-01 Friday]", timestamp: assistantTime },
+        { role: "assistant", content: [{ type: "text", text: "[00:00:00]\n" }, { type: "text", text: "历史助手消息" }], timestamp: assistantTime },
       ]);
-      expect(JSON.stringify(messages)).not.toMatch(/\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\]/);
       expect(received.slice(before).map(message => message.text)).toEqual([
         toolText("printf '测试用户喜欢简洁回答\\n' >> MEMORY.md; cat MEMORY.md"), "本地工具执行完成。",
       ]);
+      const saved = (await probe("/test/context")).body;
+      expect(saved.entries.some((entry: any) => entry.kind === "telegram.date")).toBe(true);
+      await mf.dispose();
+      mf = await runtime("TestAgent", "message-time");
+      expect((await probe("/test/context")).body).toEqual(saved);
+      const reset = await telegram(2, "/new");
+      expect(await waitJob(reset.body.id)).toMatchObject({ status: "complete" });
+      const archive = (await probe("/test/archives")).body;
+      expect(JSON.parse(archive.map((file: any) => file.content).join(""))).toEqual(saved.entries.toReversed());
     } finally { await mf.dispose(); mf = previous; }
   });
 
@@ -304,7 +314,8 @@ describe.sequential("real local Workers / SQLite Durable Object (no R2 binding)"
       expect(view.context.head).toMatchObject({ kind: "pi.compaction", data: { reason: "manual" } });
       expect(JSON.stringify(view.context.messages)).toContain("测试压缩摘要");
       expect(JSON.stringify(view.context.messages)).not.toContain("old-fact-0");
-      expect(view.context.messages.at(-1)).toMatchObject({ role: "user", content: history.at(-1) });
+      expect(view.context.messages.at(-1).role).toBe("user");
+      expect(stripTimePrefix(view.context.messages.at(-1).content)).toBe(history.at(-1));
       expect(view.entries.filter((entry: { kind: string }) => entry.kind === "pi.user")).toHaveLength(history.length);
       expect(JSON.stringify(view.entries)).toContain("old-fact-0");
       expect(JSON.stringify(view.entries)).not.toContain("/compact");
@@ -522,7 +533,7 @@ describe.sequential("real local Workers / SQLite Durable Object (no R2 binding)"
         expect(removed).toMatchObject({ id: old.id, kind: "telegram.discarded" });
         for (const field of ["model", "data", "edits", "head"]) expect(removed[field]).toBeUndefined();
       }
-      expect(after.context.messages.filter((message: any) => message.role === "user" && message.content === "intermediate-text")).toHaveLength(1);
+      expect(after.context.messages.filter((message: any) => message.role === "user" && stripTimePrefix(message.content) === "intermediate-text")).toHaveLength(1);
       expect(JSON.stringify(after.entries)).not.toContain("/retry");
       expect(received.at(-1)).toMatchObject({ reply_parameters: { message_id: sourceJob.replyTo } });
       const calls = telegramCalls.length;
@@ -672,7 +683,7 @@ describe.sequential("real local Workers / SQLite Durable Object (no R2 binding)"
       const again = await telegram(4, "/retry");
       expect((await waitJob(again.body.id)).status).toBe("complete");
       const context = (await probe("/test/context")).body.context.messages;
-      expect(context.filter((message: any) => message.role === "user").map((message: any) => message.content)).toEqual(["earlier-user-input", "latest-unplaced-input"]);
+      expect(context.filter((message: any) => message.role === "user").map((message: any) => stripTimePrefix(message.content))).toEqual(["earlier-user-input", "latest-unplaced-input"]);
     } finally { nextTelegramId = undefined; await mf.dispose(); mf = previous; }
   });
 
@@ -692,7 +703,7 @@ describe.sequential("real local Workers / SQLite Durable Object (no R2 binding)"
       expect(sentMessageIds.length).toBeGreaterThan(before + oldIds.length);
       if (input === "length-text") expect(received.at(-2)?.text).toBe('(stopReason: "length")');
       const context = (await probe("/test/context")).body.context.messages;
-      expect(context.filter((message: any) => message.role === "user" && message.content === input)).toHaveLength(1);
+      expect(context.filter((message: any) => message.role === "user" && stripTimePrefix(message.content) === input)).toHaveLength(1);
     } finally { nextTelegramId = undefined; await mf.dispose(); mf = previous; }
   });
 
@@ -743,7 +754,7 @@ describe.sequential("real local Workers / SQLite Durable Object (no R2 binding)"
       expect(await waitJob(retry.body.id)).toMatchObject({ status: "complete", retry: { entry: original.id } });
       expect((await waitJob(next.body.id)).status).toBe("complete");
       const context = (await probe("/test/context")).body.context.messages;
-      expect(context.filter((message: any) => message.role === "user" && message.content === "later-user-input")).toHaveLength(1);
+      expect(context.filter((message: any) => message.role === "user" && stripTimePrefix(message.content) === "later-user-input")).toHaveLength(1);
     } finally { nextTelegramId = undefined; await mf.dispose(); mf = previous; }
   }, 10_000);
 

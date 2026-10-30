@@ -1,10 +1,26 @@
-import { ROOT_CONVERSATION_ID, type EntryId } from "@earendil-works/pi-durable";
+import { ROOT_CONVERSATION_ID, type EntryId, type Storage } from "@earendil-works/pi-durable";
+import { openDurableObjectSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/cloudflare";
 import type { FsObject } from "@stablemodels/durable-bash/object";
 import { MAX_FILE_BYTES } from "../memory/store.js";
+import { timestampEntry } from "./timestamps.js";
 
-export { openDurableObjectSqliteStorage as openAgentStorage } from "@earendil-works/pi-durable/storage/sqlite/cloudflare";
+export async function openAgentStorage(storage: DurableObjectStorage): Promise<Storage> {
+  const backend = await openDurableObjectSqliteStorage(storage);
+  return Object.assign(backend, {
+    prepareEntry: ((conversationId, value, staged) => {
+      if (!value.model?.some(message => message.role !== "system")) return [value];
+      const previous = staged.filter(entry => entry.conversationId === conversationId)
+        .flatMap(entry => entry.model ?? []).reverse().find(message => message.role !== "system");
+      const persisted = previous ? undefined : storage.sql.exec<{ timestamp: number }>(`SELECT json_extract(message.value, '$.timestamp') AS timestamp
+        FROM entries, json_each(entries.record, '$.model') AS message
+        WHERE conversation_id = ? AND json_extract(message.value, '$.role') != 'system'
+        ORDER BY entries.id DESC, CAST(message.key AS INTEGER) DESC LIMIT 1`, conversationId).toArray()[0];
+      return timestampEntry(value, previous?.timestamp ?? persisted?.timestamp);
+    }) satisfies NonNullable<Storage["prepareEntry"]>,
+  });
+}
 
-// shortcut: these are Pi Durable 1.3.0's session tables; review before upgrading.
+// shortcut: these are Pi Durable 1.4.0's session tables; review before upgrading.
 // The caller must close its Harness and transactionally checkpoint the deletion.
 export function discardAgentSession(sql: SqlStorage): void {
   for (const { name } of sql.exec<{ name: string }>(`SELECT name FROM sqlite_master WHERE type = 'table' AND name IN

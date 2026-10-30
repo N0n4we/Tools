@@ -158,6 +158,13 @@ export class TelegramOutput {
   }
 
   async entry(entry: EntryRecord, after: number, signal: AbortSignal) {
+    // Hide the persisted metadata block without shifting live/committed presentation keys.
+    entry = { ...entry, model: entry.model?.map(message => {
+      if (message.role !== "assistant") return message;
+      const first = message.content[0];
+      return first?.type === "text" && /^\[\d{2}:\d{2}:\d{2}\]\n$/.test(first.text)
+        ? { ...message, content: message.content.slice(1) } : message;
+    }) };
     if (entry.kind === ToolResultEntry.kind) {
       for (const message of entry.model ?? []) {
         if (message.role === "toolResult") await this.toolStatus(`${after}:${message.toolCallId}`, message.isError ? "failed" : "done", signal);
