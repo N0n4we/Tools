@@ -1,7 +1,11 @@
 # Workers cannot load these optional native compression addons.
 allowBuilds:
+  '@google/genai': set this to true or false
   '@mongodb-js/zstd': false
+  esbuild: set this to true or false
   node-liblzma: false
+  protobufjs: set this to true or false
+  workerd: set this to true or false
 minimumReleaseAgeExclude:
   - '@cloudflare/workers-types@5.20261007.1'
 patchedDependencies:

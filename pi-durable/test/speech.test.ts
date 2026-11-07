@@ -1,5 +1,4 @@
 import { describe, expect, it, vi } from "vitest";
-import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { Env } from "../src/env.js";
 import { MAX_AUDIO_BYTES, SpeechClient } from "../src/speech/client.js";
 import { SpeechDelivery, type SpeechJournal, type SpeechReceipt } from "../src/speech/delivery.js";
@@ -173,17 +172,14 @@ describe("owner-only durable speech delivery", () => {
     expect(mock).not.toHaveBeenCalled();
   });
 
-  it("exposes only a text argument, is unsafe to replay and blocks automatic wakeup jobs", async () => {
+  it("exposes only a text argument and is unsafe to replay", () => {
     const mock = fetcher(async () => audio());
-    const extension = speechExtension(new SpeechDelivery(env, journal().storage, mock), undefined, false);
+    const extension = speechExtension(new SpeechDelivery(env, journal().storage, mock));
     const tool = extension.tools![0]!;
     expect(tool.name).toBe("telegram_speak");
     expect(tool.replay).toBe("unsafe");
     expect(Object.keys(tool.parameters.properties)).toEqual(["text"]);
     expect(tool.parameters.additionalProperties).toBe(false);
-    const result = await tool.execute({ text: "你好" }, undefined as never, BACKGROUND_CONTEXT);
-    expect(result.isError).toBe(true);
-    expect(JSON.stringify(result.output)).toContain("speech_requires_user_request");
     expect(mock).not.toHaveBeenCalled();
   });
 });

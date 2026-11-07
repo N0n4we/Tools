@@ -26,7 +26,7 @@ async function handle(request: Request, env: Env): Promise<Response> {
     // Ignore other users, group chats, edited updates and unsupported media.
     if (!input) return Response.json({ ok: true, ignored: true });
     const response = await agent(env).fetch(internalRequest("/enqueue", {
-      requestId: `telegram:${input.updateId}`, input: input.text, chatId: input.chatId, replyTo: input.messageId,
+      requestId: `telegram:${input.updateId}`, input: input.text, image: input.image, video: input.video, mediaGroupId: input.mediaGroupId, chatId: input.chatId, replyTo: input.messageId,
     }));
     if (!response.ok) return response;
     return Response.json({ ok: true, ...await response.json() as object });
@@ -44,16 +44,6 @@ const worker: ExportedHandler<Env> = {
     response.headers.set("cache-control", "no-store");
     response.headers.set("x-content-type-options", "nosniff");
     return response;
-  },
-  async scheduled(event, env, ctx) {
-    // Cron is opt-in in wrangler.jsonc; Cloudflare cron expressions are UTC.
-    ctx.waitUntil((async () => {
-      const response = await agent(env).fetch(internalRequest("/enqueue", {
-        requestId: `cron:${event.cron}:${event.scheduledTime}`, kind: "scheduled", chatId: Number(ownerId(env)),
-        input: "定时文字叫醒：每轮在同一条 assistant 消息中写简短中文起床提醒并调用 bash 执行 sleep 120s，等待后查看新回复；用户明确表示清醒或累计 6 小时后结束。",
-      }));
-      if (!response.ok) throw new Error("Scheduled task admission failed");
-    })());
   },
 };
 

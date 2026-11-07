@@ -3,13 +3,15 @@ import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completio
 import type { Env } from "../env.js";
 import { requiredSecret } from "../env.js";
 import { textField } from "../http.js";
+import { videoApi, type VideoReader } from "./video.js";
+import { imageApi, type ImageReader } from "./images.js";
 
 export interface AgentModels {
   models: Models;
   model: { provider: string; modelId: string };
 }
 
-export function openRouterModels(env: Env): AgentModels {
+export function openRouterModels(env: Env, videos?: VideoReader, images?: ImageReader): AgentModels {
   const apiKey = requiredSecret(env.OPENROUTER_API_KEY, "OPENROUTER_API_KEY");
   const modelId = textField(env.PI_MODEL ?? "xiaomi/mimo-v2.6-flash", "PI_MODEL", 256);
   const models = createModels();
@@ -18,13 +20,13 @@ export function openRouterModels(env: Env): AgentModels {
     auth: { apiKey: { name: "OpenRouter API key", resolve: async () => ({ auth: { apiKey } }) } },
     models: [{
       id: modelId, name: modelId, provider: "openrouter", api: "openai-completions", baseUrl: "https://openrouter.ai/api/v1",
-      reasoning: true, input: ["text"],
+      reasoning: true, input: ["text", "image"],
       // shortcut: the context window matches the current 1M-context models; adjust for smaller models.
-      contextWindow: 1_048_576, maxTokens: 80_000,
+      contextWindow: 1_048_576, maxTokens: 20_000,
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       compat: { supportsStrictMode: true, requiresReasoningContentOnAssistantMessages: modelId.startsWith("deepseek/") },
     }],
-    api: openAICompletionsApi(),
+    api: imageApi(videoApi(openAICompletionsApi(), videos), images),
   }));
   return { models, model: { provider: "openrouter", modelId } };
 }

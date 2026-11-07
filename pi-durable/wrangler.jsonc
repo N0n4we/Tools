@@ -6,7 +6,7 @@
   "compatibility_flags": ["nodejs_compat"],
   "workers_dev": true,
   "vars": {
-    "PI_MODEL": "deepseek/deepseek-v4.1-flash-1017",
+    "PI_MODEL": "moonshotai/kimi-k3.1-pro",
     "MEMORY_PREFIX": "hermes/",
     "WEB_SEARCH_PROVIDER": "exa"
   },
@@ -16,7 +16,6 @@
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["AgentBackend"] }
   ],
-  // Cloudflare Cron uses UTC: 00:00 UTC = 08:00 Asia/Shanghai the same day.
-  "triggers": { "crons": ["0 0 * * *"] },
+  "triggers": { "crons": [] },
   "observability": { "enabled": true }
 }

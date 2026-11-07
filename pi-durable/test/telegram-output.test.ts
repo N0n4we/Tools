@@ -27,7 +27,50 @@ function fixture() {
 afterEach(() => { vi.unstubAllGlobals(); vi.useRealTimers(); });
 
 describe("durable Telegram presentation", () => {
-  it("deletes only reply receipts, including earlier streamed thinking, voice and paginated batches", async () => {
+  it("keeps the receipt of an in-flight send after abort and stops all later parts so retry can delete it", async () => {
+    const { output, rows } = fixture();
+    let begin!: () => void;
+    let release!: (response: Response) => void;
+    const started = new Promise<void>(resolve => { begin = resolve; });
+    const receipt = new Promise<Response>(resolve => { release = resolve; });
+    let transportSignal: AbortSignal | undefined;
+    const send = vi.fn(async (_url: string, init: RequestInit) => {
+      transportSignal = init.signal ?? undefined;
+      begin();
+      return receipt;
+    });
+    vi.stubGlobal("fetch", send);
+    const controller = new AbortController();
+    const delivery: TextDelivery = { status: "ready", parts: ["first part", "later part"], nextPart: 0, deliveryAttempts: 0 };
+    const sending = output.deliver("assistant:10:0:0", delivery, controller.signal);
+    await started;
+    output.stop();
+    controller.abort();
+    expect(transportSignal?.aborted).toBe(false);
+    release(Response.json({ ok: true, result: { message_id: 101 } }));
+    await sending;
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(rows.get("assistant:10:0:0")).toMatchObject({ status: "ready", sentIds: [101], nextPart: 1 });
+    await output.deliver("assistant:10:0:0", delivery, controller.signal);
+    expect(send).toHaveBeenCalledTimes(1);
+    const remove = vi.fn(async (_url: string, init: RequestInit) => {
+      expect(JSON.parse(init.body as string).message_ids).toEqual([101]);
+      return Response.json({ ok: true, result: true });
+    });
+    vi.stubGlobal("fetch", remove);
+    await output.removeReplies({ entry: 0, after: 0, replyTo: 2, sequence: 1 });
+    expect(remove).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["last", "abort"])("excludes %s command receipts from retry cleanup even if their delivery is uncertain", async kind => {
+    const { output, rows, calls } = fixture();
+    rows.set("job:control", { kind, sequence: 2, status: "failed", error: "telegram_delivery_uncertain", nextPart: 0, deliveryAttempts: 1, sentIds: [102] } as TextDelivery);
+    rows.set("assistant:10:0:0", { status: "complete", nextPart: 1, deliveryAttempts: 0, sentIds: [101] });
+    await output.removeReplies({ entry: 0, after: 0, replyTo: 2, sequence: 1 });
+    expect(calls.map(call => call.body.message_ids)).toEqual([[101]]);
+  });
+
+  it.each([false, true])("deletes the selected replies and optionally their input, respecting message boundaries and paginated batches (includeInput=%s)", async includeInput => {
     const { rows, calls, output } = fixture();
     const receipt = (ids: number[]): TextDelivery => ({ status: "complete", sentIds: ids, nextPart: 1, deliveryAttempts: 0 });
     rows.set("assistant:10:0:0", receipt([5]));
@@ -37,17 +80,17 @@ describe("durable Telegram presentation", () => {
     rows.set("speech:voice", { status: "sent", messageId: 13 } as unknown as TextDelivery);
     for (let i = 0; i < 250; i++) rows.set(`assistant:${100 + i}:0:0`, { ...receipt([1000 + i, 1000 + i]), editId: 1000 + i });
     const original = structuredClone(rows);
-    await output.removeReplies({ entry: 20, after: 10, replyTo: 10, sequence: 2 });
+    await output.removeReplies({ entry: 20, after: 10, replyTo: 10, sequence: 2 }, includeInput);
     expect(calls.every(call => call.method === "deleteMessages" && call.body.chat_id === 123 && call.body.message_ids.length <= 100)).toBe(true);
     const deleted = calls.flatMap(call => call.body.message_ids).sort((a, b) => a - b);
-    expect(deleted).toEqual([9, 12, 13, ...Array.from({ length: 250 }, (_, i) => 1000 + i)]);
+    expect(deleted).toEqual([includeInput ? 10 : 9, 12, 13, ...Array.from({ length: 250 }, (_, i) => 1000 + i)]);
     expect(rows).toEqual(original);
   });
 
-  it("stops a retry rather than silently skipping an outgoing message with no known ID", async () => {
+  it.each([false, true])("stops cleanup when an outgoing message has no known ID (includeInput=%s)", async includeInput => {
     const { rows, calls, output } = fixture();
     rows.set("assistant:30:0:0", { status: "failed", error: "telegram_delivery_uncertain", nextPart: 0, deliveryAttempts: 1 });
-    await expect(output.removeReplies({ entry: 20, after: 10, replyTo: 10, sequence: 2 })).rejects.toThrow("发送回执不完整");
+    await expect(output.removeReplies({ entry: 20, after: 10, replyTo: 10, sequence: 2 }, includeInput)).rejects.toThrow("发送回执不完整");
     expect(calls).toHaveLength(0);
   });
 

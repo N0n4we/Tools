@@ -61,5 +61,4 @@ export default {
       return request.method === "POST" ? await agent.migrateFiles() : Response.json(await agent.migrationStatus(), { headers: { "cache-control": "no-store" } });
     } catch (error) { return errorResponse(error); }
   },
-  async scheduled() {},
 } satisfies ExportedHandler<MigrationEnv>;

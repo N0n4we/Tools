@@ -3,18 +3,33 @@ import { AgentBackend, type Job } from "../src/agent.js";
 import { errorResponse } from "../src/http.js";
 import { validatePath } from "../src/memory/store.js";
 import { openAgentStorage } from "../src/pi/storage.js";
+import { COMPACT_CHECKPOINT_KEY, RESTORED_CONTEXT_KEY } from "../src/pi/checkpoint.js";
+import { isVideoContent } from "../src/video/store.js";
+import { imageContext } from "../src/pi/images.js";
 import type { TextDelivery } from "../src/telegram-output.js";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { AssistantEntry, Harness, ProviderDoc, SystemEntry, UserEntry, createRegistry } from "@earendil-works/pi-durable";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxProvider, fauxAssistantMessage, fauxText, fauxThinking, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { getCurrentSystemMessage, getCurrentTools } from "@earendil-works/pi-ai/utils/transcript";
+import type { TranscriptContext } from "@earendil-works/pi-ai";
+
+// Faux fingerprints every non-text part via `data.length`. The application's
+// video extension needs a stable test-only fingerprint, without altering history.
+function fauxVideoContext(context: TranscriptContext): TranscriptContext {
+  return { ...context, messages: context.messages.map(message => {
+    if (message.role !== "user" || !Array.isArray(message.content)) return message;
+    const content = (message.content as unknown[]).map(block => isVideoContent(block) ? { ...block, data: block.id } : block) as typeof message.content;
+    return { ...message, content };
+  }) };
+}
 
 // Probes exist only in the test Worker and are called through the namespace stub.
 export class ProbeAgent extends AgentBackend {
   override async fetch(request: Request) {
     try {
       const url = new URL(request.url);
+      if (url.pathname === "/test/model-http-abort") return Response.json({ aborted: await this.ctx.storage.get("test:model-http-aborted") === true });
       if (url.pathname.startsWith("/test/jobs/")) {
         const id = url.pathname.slice("/test/jobs/".length);
         const job = await this.ctx.storage.get<Job>(`job:${id}`);
@@ -24,6 +39,7 @@ export class ProbeAgent extends AgentBackend {
           job.nextPart = 0;
           delete job.parts;
           delete job.sentIds;
+          if (url.searchParams.has("kind")) job.kind = url.searchParams.get("kind") as Job["kind"];
           if (url.searchParams.has("expired")) job.createdAt = Date.now() - 7 * 60 * 60_000;
           await this.ctx.storage.put({ [`job:${id}`]: job, [`pending:${String(job.sequence).padStart(16, "0")}`]: id });
         }
@@ -69,6 +85,22 @@ export class ProbeAgent extends AgentBackend {
           return Response.json({ context: await root.context(BACKGROUND_CONTEXT), entries: (await root.entries({}, 1000, undefined, BACKGROUND_CONTEXT)).items, provider: await harness.snapshot(ProviderDoc, root.id, BACKGROUND_CONTEXT) });
         } finally { await harness.close(BACKGROUND_CONTEXT); }
       }
+      if (url.pathname === "/test/checkpoint") {
+        const sql = this.ctx.storage.sql;
+        const tables = ["record_ids", "conversations", "entries", "tasks", "submissions", "documents", "document_revisions"].map(name => `compact_snapshot_${name}`);
+        if (request.method === "PUT") sql.exec("CREATE TRIGGER test_checkpoint_save_failure BEFORE DELETE ON compact_snapshot_entries BEGIN SELECT RAISE(ABORT, 'simulated checkpoint save failure'); END");
+        if (request.method === "DELETE") {
+          if (url.searchParams.has("forget")) {
+            await this.ctx.storage.delete(COMPACT_CHECKPOINT_KEY);
+            for (const table of [...tables, "compact_snapshot_inputs"]) sql.exec(`DROP TABLE IF EXISTS ${table}`);
+          } else sql.exec("DROP TRIGGER test_checkpoint_save_failure");
+        }
+        return Response.json({
+          checkpoint: await this.ctx.storage.get(COMPACT_CHECKPOINT_KEY) ?? null,
+          restored: await this.ctx.storage.get(RESTORED_CONTEXT_KEY) ?? null,
+          tables: Object.fromEntries(tables.map(table => [table, sql.exec("SELECT 1 FROM sqlite_master WHERE name = ?", table).toArray().length ? sql.exec<{ count: number }>(`SELECT COUNT(*) AS count FROM ${table}`).toArray()[0]!.count : 0])),
+        });
+      }
       if (url.pathname === "/test/session") {
         const sql = this.ctx.storage.sql;
         const trigger = url.searchParams.has("retry") ? "test_retry_failure" : "test_discard_failure";
@@ -94,6 +126,15 @@ export class ProbeAgent extends AgentBackend {
         return Response.json(sql.exec<{ path: string; bytes: number; etag: string }>(
           "SELECT path, size AS bytes, etag FROM files WHERE path GLOB '/hermes/123/archives/*' AND is_dir = 0 ORDER BY path",
         ).toArray().map(file => ({ ...file, content: this.readFile(file.path).content })));
+      }
+      if (url.pathname === "/test/videos") {
+        const sql = this.ctx.storage.sql;
+        if (request.method === "PUT") sql.exec(`CREATE TRIGGER test_video_failure BEFORE INSERT ON telegram_video_chunks WHEN NEW.part = 1 BEGIN SELECT RAISE(ABORT, 'simulated video storage failure'); END`);
+        if (request.method === "DELETE") sql.exec("DROP TRIGGER test_video_failure");
+        return Response.json({
+          videos: sql.exec("SELECT id, mime_type, size FROM telegram_videos ORDER BY id").toArray(),
+          chunks: sql.exec("SELECT video_id, part, length(data) AS bytes FROM telegram_video_chunks ORDER BY video_id, part").toArray(),
+        });
       }
       if (url.pathname === "/test/memory/file") {
         const path = validatePath(url.searchParams.get("path")!);
@@ -143,18 +184,32 @@ export class TestAgent extends ProbeAgent {
         if (first !== prefix) throw new Error(`Missing message timestamp for ${message.role}: ${first}`);
       }
       const tools = getCurrentTools(context.messages).map(tool => tool.name).sort();
-      const expected = input.includes("定时文字叫醒") ? ["bash", "fetch_content", "web_search"] : ["bash", "fetch_content", "telegram_speak", "web_search"];
+      const expected = ["bash", "fetch_content", "telegram_speak", "web_search"];
       if (JSON.stringify(tools) !== JSON.stringify(expected)) throw new Error(`Unexpected tools: ${tools.join(", ")}`);
       const sections = getCurrentSystemMessage(context.messages)?.sections;
+      const images = user?.role === "user" && Array.isArray(user.content) ? user.content.filter(block => block.type === "image") : [];
+      const video = user?.role === "user" && Array.isArray(user.content) ? user.content.find(isVideoContent) : undefined;
+      if (input.includes("mixed-album-input")) {
+        if (!video || images.length !== 1) throw new Error("Incomplete mixed album input");
+        return fauxAssistantMessage("已收到混合相册。");
+      }
+      if (video) {
+        if (!/^[a-f0-9]{64}$/.test(video.id) || video.size < 1) throw new Error("Missing persisted video reference");
+        return fauxAssistantMessage("已收到视频。");
+      }
+      if (input.includes("image-input") || images.length) {
+        if (!images.length || images.some(image => image.mimeType !== "image/png" || !image.data.startsWith("iVBORw0KGgo"))) throw new Error("Missing image input");
+        return fauxAssistantMessage("已收到图片。");
+      }
       if (input.includes("role-format")) {
         if (!sections?.conversation?.includes("测试角色小岚") || !sections.conversation.includes("动作必须用（）包裹")) throw new Error("Role preferences were not loaded before the first reply");
         return fauxAssistantMessage(input.includes("second") ? "[2026-10-25 Sunday]\n[12:03:34]（微笑）第二轮。" : "（轻轻点头）第一轮。");
       }
-      if (input.includes("定时文字叫醒")) {
-        if (!last || Math.abs(Date.now() - last.timestamp) > 120_000) throw new Error("Latest message time is stale");
-        if (getCurrentTools(context.messages).some(tool => tool.name === "telegram_speak")) throw new Error("Wakeup still offers the speech tool");
+      if (input.includes("finish-task")) return fauxAssistantMessage("任务已结束。");
+      if (input.includes("abort-sleep")) {
+        if (last?.role === "toolResult") return fauxAssistantMessage("睡眠结束。");
+        return fauxAssistantMessage([fauxText("睡眠任务开始。"), fauxToolCall("bash", { command: "sleep 120" })], { stopReason: "toolUse" });
       }
-      if (input.includes("我醒了")) return fauxAssistantMessage("已停止提醒。");
       if (input.includes("intermediate-text")) {
         if (last?.role === "toolResult" && input.includes("then-fail")) return fauxAssistantMessage("失败的部分正文。", { stopReason: "error", errorMessage: "fixture failure" });
         if (last?.role === "toolResult") return fauxAssistantMessage([fauxThinking("最终思考内容。"), fauxText("最终正文。")]);
@@ -170,7 +225,7 @@ export class TestAgent extends ProbeAgent {
       if (input.includes("aborted-text")) return fauxAssistantMessage("中断的部分正文。", { stopReason: "aborted" });
       if (input.includes("failed-text")) return fauxAssistantMessage("失败的部分正文。", { stopReason: "error", errorMessage: "fixture failure" });
       if (last?.role === "toolResult") {
-        if (input.includes("定时文字叫醒") && last.isError && JSON.stringify(last.content).includes("interrupted")) return fauxAssistantMessage(fauxToolCall("bash", { command: "sleep 1" }), { stopReason: "toolUse" });
+        if (input.includes("long-running-task") && last.isError && JSON.stringify(last.content).includes("interrupted")) return fauxAssistantMessage(fauxToolCall("bash", { command: "sleep 1" }), { stopReason: "toolUse" });
         if (last.toolName === "telegram_speak") {
           if (last.isError) return fauxAssistantMessage("语音发送未确认，请检查 Telegram，不会自动重试。");
           const result = JSON.parse(last.content.slice(1).flatMap(block => block.type === "text" ? [block.text] : []).join(""));
@@ -203,11 +258,15 @@ export class TestAgent extends ProbeAgent {
       if (input.includes("网页")) return fauxAssistantMessage(fauxToolCall("fetch_content", { url: "https://example.com/story" }), { stopReason: "toolUse" });
       if (input.includes("persist-skill")) return fauxAssistantMessage(fauxToolCall("bash", { command: "mkdir -p skills/test/nested/references; printf '持久化技能参考' > skills/test/nested/references/check.md; cat skills/test/nested/references/check.md" }), { stopReason: "toolUse" });
       if (input.includes("bash-files")) return fauxAssistantMessage(fauxToolCall("bash", { command: "cat MEMORY.md; mkdir -p skills/bash/demo; printf '持久化技能参考' > skills/bash/demo/SKILL.md; cat skills/bash/demo/SKILL.md; printf 'bash 追加记忆\\n' >> MEMORY.md; test -z \"$OPENROUTER_API_KEY$TELEGRAM_BOT_TOKEN$EXA_API_KEY\"" }), { stopReason: "toolUse" });
-      if (input.includes("定时文字叫醒")) return fauxAssistantMessage([fauxText("起床啦，开始新的一天。"), fauxToolCall("bash", { command: "sleep 1" })], { stopReason: "toolUse" });
+      if (input.includes("long-running-task")) return fauxAssistantMessage([fauxText("任务正在执行。"), fauxToolCall("bash", { command: "sleep 1" })], { stopReason: "toolUse" });
       return fauxAssistantMessage("本地测试回答。");
     }));
     const models = createModels();
-    models.setProvider(faux.provider);
+    models.setProvider({
+      ...faux.provider,
+      stream: (model, context, options) => faux.provider.stream(model, fauxVideoContext(imageContext(context, this.images)), options),
+      streamSimple: (model, context, options) => faux.provider.streamSimple(model, fauxVideoContext(imageContext(context, this.images)), options),
+    });
     return { models, model: { provider: "faux", modelId: "faux-1" } };
   }
 }
@@ -222,12 +281,34 @@ export class StreamingAgent extends ProbeAgent {
   }
 }
 
+export class AbortProbeAgent extends ProbeAgent {
+  protected override modelRuntime() {
+    const runtime = super.modelRuntime();
+    const provider = runtime.models.getProvider("openrouter")!;
+    const observeFetch: typeof fetch = (input, init) => {
+      const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
+      signal?.addEventListener("abort", () => { void this.ctx.storage.put("test:model-http-aborted", true); }, { once: true });
+      return fetch(input, init);
+    };
+    runtime.models.setProvider({
+      ...provider,
+      stream: (model, context, options) => provider.stream(model, context, { ...options, fetch: observeFetch }),
+      streamSimple: (model, context, options) => provider.streamSimple(model, context, { ...options, fetch: observeFetch }),
+    });
+    return runtime;
+  }
+}
+
 export class FailSecondAgent extends TestAgent {
   private modelCalls = 0;
   protected override modelRuntime() {
     if (++this.modelCalls === 2) throw new Error("simulated model configuration failure");
     return super.modelRuntime();
   }
+}
+
+export class NoModelAgent extends ProbeAgent {
+  protected override modelRuntime(): ReturnType<ProbeAgent["modelRuntime"]> { throw new Error("Model configuration is unavailable"); }
 }
 
 export { AgentBackend };

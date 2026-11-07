@@ -28,31 +28,36 @@ export function replyParts(reply: string): string[] {
 }
 
 export class TelegramOutput {
+  private stopped = false;
   private readonly tools = new Map<string, { key: string; view: Extract<TelegramView, { type: "tool" }> }>();
   private readonly progressAt = new Map<string, number>();
 
   constructor(private readonly storage: DurableObjectStorage, private readonly token: string | undefined, private readonly job: { id: string; chatId?: number; replyTo?: number; retry?: { replyTo: number } }) {}
 
-  async removeReplies(from: { entry: number; after: number; replyTo: number; sequence: number }): Promise<void> {
-    if (this.job.chatId === undefined) throw new HttpError(400, "Retry requires a Telegram chat");
+  stop(): void { this.stopped = true; }
+
+  async removeReplies(from: { entry: number; after: number; replyTo: number; sequence: number; inputIds?: number[] }, includeInput = false): Promise<void> {
+    if (this.job.chatId === undefined) throw new HttpError(400, "Conversation cleanup requires a Telegram chat");
     const bot = new TelegramBot(requiredSecret(this.token, "TELEGRAM_BOT_TOKEN"));
-    const seen = new Set<number>();
-    let batch: number[] = [];
+    const inputIds = includeInput ? [...new Set([from.replyTo, ...from.inputIds ?? []])] : [];
+    const seen = new Set<number>(inputIds);
+    let batch: number[] = [...inputIds];
     // shortcut: scans saved receipts; index by input boundary if cleanup becomes slow.
     for (const prefix of ["assistant:", "thinking:", "job:", "speech:"]) {
       let startAfter: string | undefined;
       while (true) {
-        const page = await this.storage.list<{ sentIds?: number[]; editId?: number; messageId?: number; sequence?: number; status?: string; error?: string }>({ prefix, startAfter, limit: 100 });
+        const page = await this.storage.list<{ sentIds?: number[]; editId?: number; messageId?: number; sequence?: number; status?: string; error?: string; kind?: string }>({ prefix, startAfter, limit: 100 });
         if (!page.size) break;
         for (const [key, receipt] of page) {
           startAfter = key;
+          if (prefix === "job:" && (receipt.kind === "last" || receipt.kind === "abort")) continue;
           const related = prefix === "assistant:" ? Number(key.split(":")[1]) > from.entry
             : prefix === "thinking:" ? Number(key.split(":")[2]) >= from.after
             : prefix === "job:" ? (receipt.sequence ?? 0) >= from.sequence
             : ((await this.storage.get<{ sequence: number }>(`job:${key.slice(prefix.length)}`))?.sequence ?? 0) >= from.sequence;
-          if (related && (receipt.status === "sending" || receipt.status === "uncertain" || receipt.error === "telegram_delivery_uncertain") && !receipt.editId && !receipt.messageId) throw new HttpError(409, "上次回复的发送回执不完整，无法确认应删除的 Telegram 消息；未重试。");
+          if (related && (receipt.status === "sending" || receipt.status === "uncertain" || receipt.error === "telegram_delivery_uncertain") && !receipt.editId && !receipt.messageId) throw new HttpError(409, "上次回复的发送回执不完整，无法确认应删除的 Telegram 消息；未清理历史。");
           for (const id of [...(receipt.sentIds ?? []), receipt.editId, receipt.messageId]) {
-            if (id === undefined || (!related && id <= from.replyTo) || seen.has(id)) continue;
+            if (id === undefined || (includeInput ? id < from.replyTo : !related && id <= from.replyTo) || seen.has(id)) continue;
             seen.add(id);
             batch.push(id);
             if (batch.length === 100) { await bot.deleteMessages(this.job.chatId, batch); batch = []; }
@@ -64,6 +69,7 @@ export class TelegramOutput {
   }
 
   async deliver(key: string, delivery: TextDelivery, signal?: AbortSignal): Promise<void> {
+    if (this.stopped) return;
     if (delivery.status === "complete" || delivery.status === "failed") return;
     if (delivery.status === "sending") {
       // Telegram has no outgoing idempotency key; never replay an unacknowledged send or edit.
@@ -74,6 +80,7 @@ export class TelegramOutput {
     }
     if (delivery.retryAt && delivery.retryAt > Date.now()) return;
     for (; this.job.chatId !== undefined && delivery.nextPart < (delivery.parts?.length ?? 0);) {
+      if (this.stopped) return;
       signal?.throwIfAborted();
       delivery.status = "sending";
       await this.storage.put(key, delivery);
@@ -106,6 +113,7 @@ export class TelegramOutput {
         return;
       }
     }
+    if (this.stopped) return;
     delivery.status = delivery.error ? "failed" : "complete";
     await this.storage.put(key, delivery);
   }

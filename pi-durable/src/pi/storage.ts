@@ -58,7 +58,18 @@ export function agentInput(sql: SqlStorage, requestId: string, entry?: EntryId):
 
 // Keep entry identities for settled task/submission references, but remove their context and display payloads.
 export function discardAgentReplies(sql: SqlStorage, entry: EntryId): void {
+  discardEntries(sql, entry, false);
+}
+
+export function discardAgentTurn(sql: SqlStorage, entry: EntryId): void {
+  const previous = sql.exec<{ id: EntryId; kind: string }>(`SELECT id, json_extract(record, '$.kind') AS kind FROM entries
+    WHERE conversation_id = ? AND id < ? ORDER BY id DESC LIMIT 1`, ROOT_CONVERSATION_ID, entry).toArray()[0];
+  // A date separator belongs to the following input, rather than the retained turn.
+  discardEntries(sql, previous?.kind === "telegram.date" ? previous.id : entry, true);
+}
+
+function discardEntries(sql: SqlStorage, entry: EntryId, inclusive: boolean): void {
   sql.exec(`UPDATE entries SET head = NULL,
     record = json_set(json_remove(record, '$.model', '$.data', '$.head', '$.edits'), '$.kind', 'telegram.discarded')
-    WHERE conversation_id = ? AND id > ?`, ROOT_CONVERSATION_ID, entry);
+    WHERE conversation_id = ? AND id ${inclusive ? ">=" : ">"} ?`, ROOT_CONVERSATION_ID, entry);
 }
