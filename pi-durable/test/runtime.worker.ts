@@ -129,11 +129,29 @@ export class ProbeAgent extends AgentBackend {
       }
       if (url.pathname === "/test/videos") {
         const sql = this.ctx.storage.sql;
-        if (request.method === "PUT") sql.exec(`CREATE TRIGGER test_video_failure BEFORE INSERT ON telegram_video_chunks WHEN NEW.part = 1 BEGIN SELECT RAISE(ABORT, 'simulated video storage failure'); END`);
-        if (request.method === "DELETE") sql.exec("DROP TRIGGER test_video_failure");
+        if (request.method === "PUT") {
+          // Downgrade a synthetic active entry to the previous video format.
+          sql.exec("DELETE FROM video_storage_migrations");
+          const { id, record } = sql.exec<{ id: number; record: string }>("SELECT id, record FROM entries WHERE record LIKE '%video-legacy%' LIMIT 1").one();
+          const entry = JSON.parse(record);
+          const active = entry.model[0].content.find(isVideoContent);
+          const video = { type: "video", id: "a".repeat(64), mimeType: active.mimeType, size: active.size };
+          entry.model[0].content = entry.model[0].content.map((block: unknown) => isVideoContent(block) ? video : block);
+          sql.exec("UPDATE entries SET record = ? WHERE id = ?", JSON.stringify(entry), id);
+          sql.exec("CREATE TABLE telegram_videos (id TEXT PRIMARY KEY, file_id TEXT, mime_type TEXT, size INTEGER)");
+          sql.exec("INSERT INTO telegram_videos VALUES (?, ?, ?, ?)", video.id, active.fileId, video.mimeType, video.size);
+          sql.exec("CREATE TABLE telegram_video_chunks (video_id TEXT, part INTEGER, data BLOB)");
+          sql.exec("INSERT INTO telegram_video_chunks VALUES (?, 0, X'00000018')", video.id);
+          const path = "/hermes/123/archives/legacy";
+          this.mkdir(path, { recursive: true });
+          const archive = JSON.stringify([entry]);
+          const split = archive.indexOf(JSON.stringify(video)) + 60;
+          this.writeFile(path + "/context.json.part-000000", archive.slice(0, split));
+          this.writeFile(path + "/context.json.part-000001", archive.slice(split));
+        }
         return Response.json({
-          videos: sql.exec("SELECT id, mime_type, size FROM telegram_videos ORDER BY id").toArray(),
-          chunks: sql.exec("SELECT video_id, part, length(data) AS bytes FROM telegram_video_chunks ORDER BY video_id, part").toArray(),
+          chunks: sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'telegram_video_chunks'").toArray(),
+          migrationCompleted: this.videoStorageMigrationCompleted(),
         });
       }
       if (url.pathname === "/test/memory/file") {

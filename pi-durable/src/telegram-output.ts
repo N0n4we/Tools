@@ -36,11 +36,12 @@ export class TelegramOutput {
 
   stop(): void { this.stopped = true; }
 
-  async removeReplies(from: { entry: number; after: number; replyTo: number; sequence: number; inputIds?: number[] }, includeInput = false): Promise<void> {
+  async removeReplies(from: { entry: number; after: number; replyTo: number; sequence: number; inputIds?: number[]; keepInputIds?: number[] }, includeInput = false): Promise<void> {
     if (this.job.chatId === undefined) throw new HttpError(400, "Conversation cleanup requires a Telegram chat");
     const bot = new TelegramBot(requiredSecret(this.token, "TELEGRAM_BOT_TOKEN"));
-    const inputIds = includeInput ? [...new Set([from.replyTo, ...from.inputIds ?? []])] : [];
-    const seen = new Set<number>(inputIds);
+    const keep = new Set(from.keepInputIds);
+    const inputIds = includeInput ? [...new Set([from.replyTo, ...from.inputIds ?? []])].filter(id => !keep.has(id)) : [];
+    const seen = new Set<number>([...inputIds, ...keep]);
     let batch: number[] = [...inputIds];
     // shortcut: scans saved receipts; index by input boundary if cleanup becomes slow.
     for (const prefix of ["assistant:", "thinking:", "job:", "speech:"]) {

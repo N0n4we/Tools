@@ -1,22 +1,51 @@
-import { ROOT_CONVERSATION_ID, type EntryId, type Storage } from "@earendil-works/pi-durable";
-import { openDurableObjectSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/cloudflare";
+import { ROOT_CONVERSATION_ID, type EntryId, type Storage, type StorageWrite } from "@earendil-works/pi-durable";
+import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
+import { DurableObjectSqliteDatabase } from "@earendil-works/chord/sqlite/cloudflare";
+import type { SqliteExecutor } from "@earendil-works/chord/sqlite";
 import type { FsObject } from "@stablemodels/durable-bash/object";
 import { MAX_FILE_BYTES } from "../memory/store.js";
+import { archiveVideoPlaceholders, commitVideoPlaceholders, prepareVideoEntry } from "../video/history.js";
 import { timestampEntry } from "./timestamps.js";
 
+class AgentDatabase extends DurableObjectSqliteDatabase {
+  committing?: readonly StorageWrite[];
+
+  constructor(private readonly durable: DurableObjectStorage) { super(durable); }
+
+  override transaction<T>(callback: (transaction: SqliteExecutor) => Promise<T>): Promise<T> {
+    const writes = this.committing;
+    if (!writes) return super.transaction(callback);
+    return super.transaction(async transaction => {
+      const result = await callback(transaction);
+      commitVideoPlaceholders(this.durable.sql, writes);
+      return result;
+    });
+  }
+}
+
 export async function openAgentStorage(storage: DurableObjectStorage): Promise<Storage> {
-  const backend = await openDurableObjectSqliteStorage(storage);
+  const database = new AgentDatabase(storage);
+  const backend = await SqliteStorage.open(database);
+  const commit = backend.commit.bind(backend);
+  const prepareEntry: NonNullable<Storage["prepareEntry"]> = (conversationId, value, staged) => {
+    if (!value.model?.some(message => message.role !== "system")) return [value];
+    const previous = staged.filter(entry => entry.conversationId === conversationId)
+      .flatMap(entry => entry.model ?? []).reverse().find(message => message.role !== "system");
+    const persisted = previous ? undefined : storage.sql.exec<{ timestamp: number }>(`SELECT json_extract(message.value, '$.timestamp') AS timestamp
+      FROM entries, json_each(entries.record, '$.model') AS message
+      WHERE conversation_id = ? AND json_extract(message.value, '$.role') != 'system'
+      ORDER BY entries.id DESC, CAST(message.key AS INTEGER) DESC LIMIT 1`, conversationId).toArray()[0];
+    return timestampEntry(value, previous?.timestamp ?? persisted?.timestamp)
+      .flatMap(entry => prepareVideoEntry(storage.sql, conversationId, entry, staged));
+  };
   return Object.assign(backend, {
-    prepareEntry: ((conversationId, value, staged) => {
-      if (!value.model?.some(message => message.role !== "system")) return [value];
-      const previous = staged.filter(entry => entry.conversationId === conversationId)
-        .flatMap(entry => entry.model ?? []).reverse().find(message => message.role !== "system");
-      const persisted = previous ? undefined : storage.sql.exec<{ timestamp: number }>(`SELECT json_extract(message.value, '$.timestamp') AS timestamp
-        FROM entries, json_each(entries.record, '$.model') AS message
-        WHERE conversation_id = ? AND json_extract(message.value, '$.role') != 'system'
-        ORDER BY entries.id DESC, CAST(message.key AS INTEGER) DESC LIMIT 1`, conversationId).toArray()[0];
-      return timestampEntry(value, previous?.timestamp ?? persisted?.timestamp);
-    }) satisfies NonNullable<Storage["prepareEntry"]>,
+    prepareEntry,
+    commit(writes: readonly StorageWrite[], context: Parameters<Storage["commit"]>[1]) {
+      // SqliteStorage.commit schedules its database transaction before its first await.
+      database.committing = writes;
+      try { return commit(writes, context); }
+      finally { database.committing = undefined; }
+    },
   });
 }
 
@@ -33,7 +62,7 @@ export function discardAgentSession(sql: SqlStorage): void {
 export function archiveAgentSession(sql: SqlStorage, files: Pick<FsObject, "mkdir" | "writeFile">, directory: string): void {
   const entries = sql.exec("SELECT 1 FROM sqlite_master WHERE name = 'entries' AND type = 'table'").toArray().length
     ? sql.exec<{ record: string }>("SELECT record FROM entries ORDER BY id").toArray() : [];
-  const bytes = new TextEncoder().encode(`[${entries.map(entry => entry.record).join(",")}]\n`);
+  const bytes = new TextEncoder().encode(`[${entries.map(entry => archiveVideoPlaceholders(entry.record)).join(",")}]\n`);
   files.mkdir(directory.slice(0, directory.lastIndexOf("/")), { recursive: true });
   files.mkdir(directory);
   for (let start = 0, part = 0; start < bytes.length; part++) {

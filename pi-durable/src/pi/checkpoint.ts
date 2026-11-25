@@ -1,4 +1,5 @@
 import { ROOT_CONVERSATION_ID, type EntryId } from "@earendil-works/pi-durable";
+import { retireCheckpointVideos } from "../video/history.js";
 import { HttpError } from "../http.js";
 
 export const COMPACT_CHECKPOINT_KEY = "pi:compact-checkpoint";
@@ -26,6 +27,7 @@ export function captureCompactSession(sql: SqlStorage, inputJobs: string[]): voi
     sql.exec(`DELETE FROM ${saved(table)}`);
     sql.exec(`INSERT INTO ${saved(table)} SELECT * FROM ${table}`);
   }
+  retireCheckpointVideos(sql);
   sql.exec("CREATE TABLE IF NOT EXISTS compact_snapshot_inputs (job_id TEXT PRIMARY KEY)");
   sql.exec("DELETE FROM compact_snapshot_inputs");
   for (const id of inputJobs) sql.exec("INSERT INTO compact_snapshot_inputs (job_id) VALUES (?)", id);

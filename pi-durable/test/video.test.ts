@@ -1,18 +1,17 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { openRouterModels } from "../src/pi/models.js";
-import { MAX_VIDEO_BYTES, VIDEO_CHUNK_BYTES, videoBase64, type VideoContent } from "../src/video/store.js";
+import { MAX_VIDEO_BYTES, MAX_VIDEO_CONTEXT_BYTES, videoBase64, type VideoContent } from "../src/video/store.js";
 import type { Env } from "../src/env.js";
 import type { UserMessage } from "@earendil-works/pi-ai";
-import { MAX_VIDEO_CONTEXT_BYTES } from "../src/pi/video.js";
 
 afterEach(() => { vi.unstubAllGlobals(); });
 
 describe("native video transport", () => {
   it.each(["complete", "completeSimple"] as const)("sends persisted video references as video_url data URLs while preserving caption, image and history (%s)", async mode => {
-    const video: VideoContent = { type: "video", id: "a".repeat(64), mimeType: "video/mp4", size: 16 };
+    const video: VideoContent = { type: "video", id: "a".repeat(64), fileId: "fixture", mimeType: "video/mp4", size: 16 };
     const bytes = new Uint8Array([0, 0, 0, 16, 102, 116, 121, 112, 105, 115, 111, 109, 0, 0, 0, 0]);
     const videoUrl = `data:video/mp4;base64,${videoBase64(bytes)}`;
-    const dataUrl = vi.fn(() => videoUrl);
+    const dataUrl = vi.fn(async () => videoUrl);
     const payloads: any[] = [];
     vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit) => {
       expect(String(url)).toBe("https://openrouter.ai/api/v1/chat/completions");
@@ -40,7 +39,7 @@ describe("native video transport", () => {
     const fetcher = vi.fn(); vi.stubGlobal("fetch", fetcher);
     const dataUrl = vi.fn();
     const runtime = openRouterModels({ OPENROUTER_API_KEY: "fixture-key" } as Env, { dataUrl });
-    const content = [{ type: "video", id: "a".repeat(64), mimeType: "video/mp4", size: MAX_VIDEO_BYTES + 1 }];
+    const content = [{ type: "video", id: "a".repeat(64), fileId: "fixture", mimeType: "video/mp4", size: MAX_VIDEO_BYTES + 1 }];
     expect(await runtime.models.completeSimple(runtime.models.getModel(runtime.model.provider, runtime.model.modelId), { messages: [{ role: "user", timestamp: 1, content: content as unknown as UserMessage["content"] }] })).toMatchObject({ stopReason: "error", errorMessage: expect.stringContaining("视频超过 20 MiB") });
     expect(dataUrl).not.toHaveBeenCalled(); expect(fetcher).not.toHaveBeenCalled();
   });
@@ -55,8 +54,8 @@ describe("native video transport", () => {
       { sizes: [20], omitted: 0 },
       { sizes: [20, 1], omitted: 1 },
     ])("omits $omitted oldest videos for $sizes MiB while preserving the newest", async ({ sizes, omitted }) => {
-      const videos: VideoContent[] = sizes.map((size, index) => ({ type: "video", id: String(index + 1).padStart(64, "0"), mimeType: "video/mp4", size: size * 1024 * 1024 }));
-      const dataUrl = vi.fn((video: VideoContent) => `data:video/mp4;base64,${Buffer.from(video.id).toString("base64")}`);
+      const videos: VideoContent[] = sizes.map((size, index) => ({ type: "video", id: String(index + 1).padStart(64, "0"), fileId: `fixture-${index + 1}`, mimeType: "video/mp4", size: size * 1024 * 1024 }));
+      const dataUrl = vi.fn(async (video: VideoContent) => `data:video/mp4;base64,${Buffer.from(video.id).toString("base64")}`);
       const payloads: any[] = [];
       vi.stubGlobal("fetch", vi.fn(async (_url: string, init: RequestInit) => {
         payloads.push(JSON.parse(init.body as string));
@@ -79,10 +78,8 @@ describe("native video transport", () => {
     });
   });
 
-  it("encodes independent binary chunks without corrupting base64 at their boundaries", () => {
-    const bytes = Uint8Array.from({ length: VIDEO_CHUNK_BYTES * 2 + 5 }, (_, index) => index % 256);
-    const encoded: string[] = [];
-    for (let offset = 0; offset < bytes.length; offset += VIDEO_CHUNK_BYTES) encoded.push(videoBase64(bytes.subarray(offset, offset + VIDEO_CHUNK_BYTES)));
-    expect(Buffer.from(encoded.join(""), "base64")).toEqual(Buffer.from(bytes));
+  it("encodes a large video as a single valid base64 value", () => {
+    const bytes = Uint8Array.from({ length: 394_221 }, (_, index) => index % 256);
+    expect(videoBase64(bytes)).toBe(Buffer.from(bytes).toString("base64"));
   });
 });

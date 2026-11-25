@@ -13,7 +13,8 @@ import { agentInput, archiveAgentSession, discardAgentReplies, discardAgentSessi
 import { COMPACT_CHECKPOINT_KEY, RESTORED_CONTEXT_KEY, captureCompactSession, currentCompactEntry, restoreCompactSession, restoredInputJobs, type CompactCheckpoint, type RestoredContext } from "./pi/checkpoint.js";
 import { openRouterModels, type AgentModels } from "./pi/models.js";
 import { TelegramBot, TelegramError, splitTelegramText, telegramImage, telegramVideo, type TelegramImage, type TelegramVideo } from "./telegram.js";
-import { VideoStore } from "./video/store.js";
+import { VideoSource } from "./video/store.js";
+import { migrateVideoStorage, videoStorageMigrated } from "./video/history.js";
 import { ImageStore } from "./image/store.js";
 import { TelegramOutput, replyParts, type TextDelivery } from "./telegram-output.js";
 import { WebAccess } from "./web/access.js";
@@ -75,15 +76,26 @@ export class AgentBackend extends AgentFiles {
   private aborting?: Promise<void>;
   private active?: { root: Conversation; registry: Registry; jobId: string; signal: AbortSignal; steers: Map<string, Promise<{ job: Job; submission: Submission } | undefined>> };
   private readonly memory: MemoryStore;
-  private readonly videos: VideoStore;
+  private readonly videos: VideoSource;
   protected readonly images: ImageStore;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     const base = env.MEMORY_PREFIX ?? "hermes/";
-    this.memory = new MemoryStore(ctx.storage, `${base.replace(/\/$/, "")}/${ownerId(env)}/`, this);
-    this.videos = new VideoStore(ctx.storage);
+    const owner = ownerId(env);
+    this.memory = new MemoryStore(ctx.storage, `${base.replace(/\/$/, "")}/${owner}/`, this);
+    if (ctx.id.equals(env.AGENT.idFromName(owner))) {
+      migrateVideoStorage(ctx.storage, this, `/${this.memory.prefix}archives/`);
+    }
+    this.videos = new VideoSource((video, signal) => new TelegramBot(this.env.TELEGRAM_BOT_TOKEN).downloadVideo(video, signal));
     this.images = new ImageStore(ctx.storage);
+  }
+
+  // Account-scoped Durable Object RPC, with no corresponding public Worker route.
+  videoStorageMigrationCompleted(): boolean {
+    return this.ctx.id.equals(this.env.AGENT.idFromName(ownerId(this.env)))
+      && videoStorageMigrated(this.ctx.storage.sql)
+      && !this.ctx.storage.sql.exec("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name IN ('telegram_videos', 'telegram_video_chunks')").toArray().length;
   }
 
   protected modelRuntime(): AgentModels { return openRouterModels(this.env, this.videos, this.images); }
@@ -385,7 +397,7 @@ export class AgentBackend extends AgentFiles {
         }
         content = blocks as UserMessage["content"];
       } else {
-        const attachment = await this.loadAttachment({ image, video }, bot, signal);
+        const attachment = await this.loadAttachment({ id: job.id, image, video }, bot, signal);
         // The video extension is JSON-persisted by Pi; the provider adapter handles its wire format.
         content = [...(content.trim() ? [{ type: "text", text: content }] : []), attachment] as UserMessage["content"];
       }
@@ -394,16 +406,13 @@ export class AgentBackend extends AgentFiles {
     return root.submit({ type: "input", content, requestId: job.requestId, whenBusy }, CONTEXT);
   }
 
-  private async loadAttachment(input: Pick<Job, "image" | "video">, bot: TelegramBot, signal: AbortSignal, storeImage = false) {
+  private async loadAttachment(input: Pick<Job, "id" | "image" | "video">, bot: TelegramBot, signal: AbortSignal, storeImage = false) {
     if (input.image) {
       const image = await bot.downloadImage(input.image, signal);
       return storeImage ? this.images.save(input.image.fileId, image) : image;
     }
     if (!input.video) throw new HttpError(400, "Missing Telegram attachment");
-    const existing = this.videos.find(input.video.fileId);
-    if (existing) return existing;
-    const downloaded = await bot.downloadVideo(input.video, signal);
-    return this.videos.save(input.video.fileId, downloaded.bytes, downloaded.mimeType, signal);
+    return this.videos.prepare(input.id, input.video, signal);
   }
 
   private async ready(job: Job, reply: string) {
@@ -527,7 +536,8 @@ export class AgentBackend extends AgentFiles {
     finally { await harness.close(CONTEXT); }
     await output.removeReplies({ entry: input?.entry ?? Number.MAX_SAFE_INTEGER, after: input ? input.after ?? 0 : Number.MAX_SAFE_INTEGER, replyTo, sequence: source.sequence });
     const imageBatch = source.retry?.imageBatch ?? source.imageBatch;
-    const retry = input ? { entry: input.entry, imageBatch, replyTo } : { input: source.retry?.input ?? source.input, image: source.retry?.image ?? source.image, video: source.retry?.video ?? source.video, imageBatch, replyTo };
+    const video = source.retry?.video ?? source.video;
+    const retry = input ? { entry: input.entry, video, imageBatch, replyTo } : { input: source.retry?.input ?? source.input, image: source.retry?.image ?? source.image, video, imageBatch, replyTo };
     // No Harness may retain a context cache while the old response payloads are removed.
     await this.ctx.storage.transaction(async storage => {
       if (input) discardAgentReplies(this.ctx.storage.sql, input.entry);
@@ -547,16 +557,25 @@ export class AgentBackend extends AgentFiles {
     const input = source && replyTo !== undefined ? agentInput(this.ctx.storage.sql, source.requestId, source.retry?.entry) : undefined;
     const imageBatch = source?.retry?.imageBatch ?? source?.imageBatch;
     const inputIds: number[] = [];
+    const keepInputIds: number[] = [];
+    if (replyTo !== undefined && (source?.video || source?.retry?.video)) keepInputIds.push(replyTo);
+    if (!imageBatch && input && source?.retry?.entry !== undefined && replyTo !== undefined && !keepInputIds.length) {
+      // Older retry jobs only recorded the entry ID. Recover the original input's media kind.
+      const original = this.ctx.storage.sql.exec<{ requestId: string }>(`SELECT json_extract(record, '$.requestId') AS requestId
+        FROM submissions WHERE json_extract(record, '$.type') = 'input' AND json_extract(record, '$.entry') = ?
+        AND json_extract(record, '$.requestId') IS NOT NULL ORDER BY id LIMIT 1`, input.entry).toArray()[0];
+      if (original && (await this.ctx.storage.get<Job>(`job:${await jobId(original.requestId)}`))?.video) keepInputIds.push(replyTo);
+    }
     for (const id of imageBatch ?? []) {
       const member = await this.ctx.storage.get<Job>(`job:${id}`);
-      if (member?.replyTo !== undefined) inputIds.push(member.replyTo);
+      if (member?.replyTo !== undefined) (member.video ? keepInputIds : inputIds).push(member.replyTo);
     }
     if (source && replyTo !== undefined) {
       // Cleanup must work even when the configured model or its credentials are unavailable.
       const harness = await Harness.open(await openAgentStorage(this.ctx.storage), { models: createModels(), registry: createRegistry() }, CONTEXT);
       try { await (await harness.root(CONTEXT)).abort(CONTEXT, { background: true }); }
       finally { await harness.close(CONTEXT); }
-      await output.removeReplies({ entry: input?.entry ?? Number.MAX_SAFE_INTEGER, after: input ? input.after ?? 0 : Number.MAX_SAFE_INTEGER, replyTo, sequence: source.sequence, inputIds }, true);
+      await output.removeReplies({ entry: input?.entry ?? Number.MAX_SAFE_INTEGER, after: input ? input.after ?? 0 : Number.MAX_SAFE_INTEGER, replyTo, sequence: source.sequence, inputIds, keepInputIds }, true);
     }
     const checkpoint: Job = { ...job, pop: replyTo === undefined ? {} : { entry: input?.entry, replyTo }, parts: [replyTo === undefined ? empty : success], status: "ready" };
     // The removed input, its retries and the completion checkpoint share one transaction.
@@ -792,7 +811,8 @@ export class AgentBackend extends AgentFiles {
       unsubscribe?.();
       outputAbort.abort();
       if (timeout) clearTimeout(timeout);
-      await harness.close(CONTEXT);
+      try { await harness.close(CONTEXT); }
+      finally { this.videos.clear(); }
     }
   }
 

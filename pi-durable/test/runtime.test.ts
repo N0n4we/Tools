@@ -6,7 +6,7 @@ import { beforeAll, afterAll, describe, expect, it } from "vitest";
 import { build } from "esbuild";
 import { Miniflare } from "miniflare";
 import { MAX_FILE_BYTES } from "../src/memory/store.js";
-import { MAX_VIDEO_BYTES, VIDEO_CHUNK_BYTES } from "../src/video/store.js";
+import { MAX_VIDEO_BYTES } from "../src/video/store.js";
 
 const webhook = "test-webhook-secret";
 const received: { text: string; chat_id: number; rich_message?: any; parse_mode?: string }[] = [];
@@ -22,7 +22,7 @@ const outbound: string[] = [];
 const voices: { chatId: string; bytes: number; replyTo?: number }[] = [];
 const imageRequests: string[] = [];
 const videoRequests: string[] = [];
-const videoBytes = new Uint8Array(VIDEO_CHUNK_BYTES + 37);
+const videoBytes = new Uint8Array(192 * 1024 + 37);
 const videoFixtureSizes: Record<string, number> = { "video-full-size": MAX_VIDEO_BYTES, "video-eight": 8 * 1024 * 1024, "video-seven": 7 * 1024 * 1024, "video-nine": 9 * 1024 * 1024 };
 videoBytes.set([0, 0, 0, 24, 102, 116, 121, 112, 105, 115, 111, 109, 0, 0, 0, 0, 105, 115, 111, 109, 109, 112, 52, 49]);
 videoBytes[videoBytes.length - 1] = 255;
@@ -535,7 +535,7 @@ describe.sequential("real local Workers / SQLite Durable Object (no R2 binding)"
       expect(saved.content.filter((block: any) => block.type !== "text").map((block: any) => block.type)).toEqual(["video", "image_ref"]);
       await probe(`/test/jobs/${first.body.id}`, "PUT");
       await mf.dispose(); mf = await runtime("ProbeAgent", state);
-      rejectImageDownload = true; rejectVideoDownload = true;
+      rejectImageDownload = true;
       await telegram(1, firstMedia);
       expect(await waitJob(first.body.id)).toMatchObject({ status: "complete" });
       expect(modelRequests.slice(before)).toHaveLength(1);
@@ -546,11 +546,12 @@ describe.sequential("real local Workers / SQLite Durable Object (no R2 binding)"
       expect(blocks.filter(block => block.type !== "text").map(block => block.type)).toEqual(["video_url", "image_url"]);
       expect((await probe("/test/context")).body.context.messages.filter((message: any) => message.role === "user")).toEqual([saved]);
       expect(imageRequests.slice(imageDownloads)).toEqual(["mixed-restart-image"]);
-      expect(videoRequests.slice(videoDownloads)).toEqual(["video-mixed-restart"]);
+      expect(videoRequests.slice(videoDownloads)).toEqual(["video-mixed-restart", "video-mixed-restart"]);
       const pop = await telegram(4, "/pop");
       expect(await waitJob(pop.body.id)).toMatchObject({ status: "complete" });
       expect((await probe("/test/context")).body.context.messages.filter((message: any) => message.role !== "system")).toEqual([]);
-      for (const updateId of [1, 2]) expect(deletedMessageIds.has(incomingMessageIds.get(updateId)!)).toBe(true);
+      expect(deletedMessageIds.has(incomingMessageIds.get(1)!)).toBe(false);
+      expect(deletedMessageIds.has(incomingMessageIds.get(2)!)).toBe(true);
       for (const id of [first.body.id, second.body.id]) expect((await probe(`/test/jobs/${id}`)).body.discarded).toBe(true);
     } finally { nextTelegramId = undefined; rejectImageDownload = false; rejectVideoDownload = false; await mf.dispose(); mf = previous; }
   });
@@ -812,7 +813,7 @@ describe.sequential("real local Workers / SQLite Durable Object (no R2 binding)"
     } finally { await mf.dispose(); mf = previous; }
   });
 
-  it("persists Telegram videos and sends their actual bytes to the provider as native video inputs", async () => {
+  it("persists only Telegram video references and sends actual bytes to the provider as native video inputs", async () => {
     const previous = mf;
     mf = await runtime("ProbeAgent", "video-provider");
     try {
@@ -834,14 +835,14 @@ describe.sequential("real local Workers / SQLite Durable Object (no R2 binding)"
       expect(JSON.stringify(modelRequests.at(-1))).not.toMatch(/bottest-bot|application\/x-pi-video/);
       const saved = (await probe("/test/context")).body;
       const attachment = saved.context.messages.find((message: any) => message.role === "user").content.at(-1);
-      expect(attachment).toEqual({ type: "video", id: expect.stringMatching(/^[a-f0-9]{64}$/), mimeType: "video/mp4", size: videoBytes.length });
+      expect(attachment).toEqual({ type: "video", id: expect.stringMatching(/^[a-f0-9]{64}$/), fileId: "video-provider", mimeType: "video/mp4", size: videoBytes.length });
       expect(JSON.stringify(saved.entries).length).toBeLessThan(50_000);
       expect((await telegram(1, { ...media, video: { file_id: "video-changed" } })).status).toBe(409);
       const document = await telegram(2, { document: { file_id: "video-document", mime_type: "video/mp4" } });
       expect(await waitJob(document.body.id)).toMatchObject({ status: "complete", input: "" });
       const captionCommand = await telegram(3, { ...media, caption: "/pop" });
       expect(await waitJob(captionCommand.body.id)).toMatchObject({ status: "complete", kind: "user" });
-      expect(videoRequests.slice(downloads)).toEqual(["video-provider", "video-document"]);
+      expect(videoRequests.slice(downloads)).toEqual(["video-provider", "video-document", "video-provider", "video-provider", "video-provider", "video-document"]);
     } finally { await mf.dispose(); mf = previous; }
   });
 
@@ -865,19 +866,35 @@ describe.sequential("real local Workers / SQLite Durable Object (no R2 binding)"
       const bytes = Buffer.from(newest.find(block => block.type === "video_url").video_url.url.split(",")[1], "base64");
       expect(bytes).toHaveLength(9 * 1024 * 1024);
       for (const caption of ["视频 1", "视频 2", "视频 3"]) expect(newest).toContainEqual({ type: "text", text: caption });
-      const saved = (await probe("/test/context")).body.context.messages.filter((message: any) => message.role === "user");
-      expect(saved.map((message: any) => message.content.at(-1).size)).toEqual([8, 7, 9].map(size => size * 1024 * 1024));
+      const savedView = (await probe("/test/context")).body;
+      const saved = savedView.context.messages.filter((message: any) => message.role === "user");
+      expect(JSON.stringify(savedView.entries)).not.toMatch(/video-eight|video-seven/);
+      expect(saved.map((message: any) => message.content.at(-1))).toEqual([
+        { type: "text", text: "[video omitted]" },
+        { type: "text", text: "[video omitted]" },
+        expect.objectContaining({ type: "video", size: 9 * 1024 * 1024 }),
+      ]);
       await mf.dispose(); mf = await runtime("ProbeAgent", state);
-      rejectVideoDownload = true;
+      const downloads = videoRequests.length;
       const followup = await telegram(4, "继续分析最新视频");
       expect(await waitJob(followup.body.id)).toMatchObject({ status: "complete" });
       const after = modelRequests.at(-1)!.messages.filter(message => message.role === "user").flatMap(message => typeof message.content === "string" ? [] : message.content as any[]);
       expect(after.filter(block => block.text === "[video omitted]")).toHaveLength(2);
       expect(after.filter(block => block.type === "video_url")).toHaveLength(1);
+      expect(videoRequests.slice(downloads)).toEqual(["video-nine"]);
+      for (const updateId of [5, 6]) {
+        const pop = await telegram(updateId, "/pop");
+        expect(await waitJob(pop.body.id)).toMatchObject({ status: "complete" });
+      }
+      rejectVideoDownload = true;
+      const afterPop = await telegram(7, "继续对话");
+      expect(await waitJob(afterPop.body.id)).toMatchObject({ status: "complete" });
+      expect(videoRequests.slice(downloads)).toEqual(["video-nine"]);
+      expect(JSON.stringify(modelRequests.at(-1))).not.toContain("video_url");
     } finally { rejectVideoDownload = false; await mf.dispose(); mf = previous; }
   }, 15_000);
 
-  it("stores a 20 MiB video in bounded SQLite chunks and retains it across restart, retry, pop and new sessions", async () => {
+  it("loads a 20 MiB Telegram video across restart without storing its bytes and archives a placeholder", async () => {
     const previous = mf;
     const state = "video-restart";
     mf = await runtime("ProbeAgent", state);
@@ -895,13 +912,9 @@ describe.sequential("real local Workers / SQLite Durable Object (no R2 binding)"
       const saved = (await probe("/test/context")).body.context.messages.find((message: any) => message.role === "user");
       expect(saved.content.at(-1)).toMatchObject({ type: "video", size: MAX_VIDEO_BYTES });
       const stored = (await probe("/test/videos")).body;
-      expect(stored.videos).toHaveLength(1);
-      expect(stored.chunks).toHaveLength(Math.ceil(MAX_VIDEO_BYTES / VIDEO_CHUNK_BYTES));
-      expect(stored.chunks.every((chunk: any) => chunk.bytes <= VIDEO_CHUNK_BYTES)).toBe(true);
-      expect(stored.chunks.reduce((size: number, chunk: any) => size + chunk.bytes, 0)).toBe(MAX_VIDEO_BYTES);
+      expect(stored).toEqual({ chunks: [], migrationCompleted: true });
       await probe(`/test/jobs/${source.body.id}`, "PUT");
       await mf.dispose(); mf = await runtime("ProbeAgent", state);
-      rejectVideoDownload = true;
       await telegram(1, media);
       expect((await waitJob(source.body.id)).status).toBe("complete");
       const retry = await telegram(2, "/retry");
@@ -911,12 +924,15 @@ describe.sequential("real local Workers / SQLite Durable Object (no R2 binding)"
       const pop = await telegram(3, "/pop");
       expect((await waitJob(pop.body.id)).status).toBe("complete");
       expect((await probe("/test/context")).body.context.messages.filter((message: any) => message.role !== "system")).toEqual([]);
-      expect((await probe("/test/archives")).body.some((file: any) => file.content.includes(saved.content.at(-1).id))).toBe(true);
+      const archives = (await probe("/test/archives")).body;
+      expect(archives.some((file: any) => file.content.includes("[video omitted]"))).toBe(true);
+      expect(archives.every((file: any) => !file.content.includes("video-full-size"))).toBe(true);
+      expect(deletedMessageIds.has(incomingMessageIds.get(1)!)).toBe(false);
       const reset = await telegram(4, "/new"); await waitJob(reset.body.id);
       expect((await probe("/test/videos")).body).toEqual(stored);
       const resend = await telegram(5, media);
       expect((await waitJob(resend.body.id)).status).toBe("complete");
-      expect(videoRequests.slice(downloads)).toEqual(["video-full-size"]);
+      expect(videoRequests.slice(downloads)).toEqual(["video-full-size", "video-full-size", "video-full-size"]);
     } finally { nextTelegramId = undefined; rejectVideoDownload = false; await mf.dispose(); mf = previous; }
   }, 15_000);
 
@@ -927,7 +943,7 @@ describe.sequential("real local Workers / SQLite Durable Object (no R2 binding)"
       rejectVideoDownload = true;
       const source = await telegram(1, { video: { file_id: "video-unplaced" }, caption: "重试视频" });
       expect(await waitJob(source.body.id)).toMatchObject({ status: "failed", parts: ["下载 Telegram 视频失败，请稍后重发。"] });
-      expect((await probe("/test/videos")).body.videos).toEqual([]);
+      expect((await probe("/test/videos")).body.chunks).toEqual([]);
       rejectVideoDownload = false;
       const retry = await telegram(2, "/retry");
       const retried = await waitJob(retry.body.id);
@@ -936,19 +952,27 @@ describe.sequential("real local Workers / SQLite Durable Object (no R2 binding)"
     } finally { rejectVideoDownload = false; await mf.dispose(); mf = previous; }
   });
 
-  it("rolls back partial video chunks when persistence fails", async () => {
+  it("replaces current and archived legacy videos in place without downloading the video", async () => {
     const previous = mf;
-    mf = await runtime("TestAgent", "video-storage-failure");
+    const state = "legacy-video-upgrade";
+    mf = await runtime("ProbeAgent", state);
     try {
-      await probe("/test/videos", "PUT");
-      const source = await telegram(1, { video: { file_id: "video-rollback" } });
-      expect((await waitJob(source.body.id)).status).toBe("failed");
-      expect((await probe("/test/videos")).body).toEqual({ videos: [], chunks: [] });
-      expect((await probe("/test/context")).body.context.messages.filter((message: any) => message.role !== "system")).toEqual([]);
-      await probe("/test/videos", "DELETE");
-      const retry = await telegram(2, "/retry");
-      const retried = await waitJob(retry.body.id);
-      expect(retried.status, JSON.stringify(retried)).toBe("complete");
+      const first = await telegram(1, { video: { file_id: "video-legacy" }, caption: "保留说明" });
+      expect(await waitJob(first.body.id)).toMatchObject({ status: "complete" });
+      expect((await probe("/test/videos", "PUT")).body.chunks).toHaveLength(1);
+      const downloads = videoRequests.length;
+      await mf.dispose(); mf = await runtime("ProbeAgent", state);
+      expect((await probe("/test/videos")).body).toEqual({ chunks: [], migrationCompleted: true });
+      const archives = (await probe("/test/archives")).body;
+      const [archived] = JSON.parse(archives.map((part: any) => part.content).join(""));
+      expect(archived.model[0].content).toContainEqual({ type: "text", text: "[video omitted]" });
+      expect(archived.model[0].content).toContainEqual({ type: "text", text: "保留说明" });
+      expect(videoRequests).toHaveLength(downloads);
+      const followup = await telegram(2, "继续分析视频");
+      expect(await waitJob(followup.body.id)).toMatchObject({ status: "complete" });
+      expect(videoRequests).toHaveLength(downloads);
+      expect(JSON.stringify(modelRequests.at(-1))).toContain("[video omitted]");
+      expect(JSON.stringify(modelRequests.at(-1))).not.toContain("video_url");
     } finally { await mf.dispose(); mf = previous; }
   });
 
@@ -977,7 +1001,7 @@ describe.sequential("real local Workers / SQLite Durable Object (no R2 binding)"
       expect(await probe("/enqueue", "POST", { requestId: "mixed-media", input: "mixed", image: { fileId: "image" }, video: { fileId: "video" } })).toMatchObject({ status: 400 });
       const source = await telegram(1, { video: { file_id: "video-invalid" } });
       expect(await waitJob(source.body.id)).toMatchObject({ status: "failed", parts: [expect.stringContaining("视频格式无效")] });
-      expect((await probe("/test/videos")).body.videos).toEqual([]);
+      expect((await probe("/test/videos")).body.chunks).toEqual([]);
       expect((await probe("/test/context")).body.context.messages.filter((message: any) => message.role !== "system")).toEqual([]);
     } finally { await mf.dispose(); mf = previous; }
   });
@@ -1322,13 +1346,19 @@ describe.sequential("real local Workers / SQLite Durable Object (no R2 binding)"
       const compact = await telegram(2, "/compact");
       expect((await waitJob(compact.body.id)).status).toBe("complete");
       const saved = (await probe("/test/context")).body;
-      expect(saved.entries.some((entry: any) => entry.model?.some((message: any) => Array.isArray(message.content) && message.content.some((block: any) => block.type === kind)))).toBe(true);
+      const savedBlocks = saved.entries.flatMap((entry: any) => (entry.model ?? []).flatMap((message: any) => Array.isArray(message.content) ? message.content : []));
+      if (kind === "video") expect(savedBlocks).toContainEqual({ type: "text", text: "[video omitted]" });
+      else expect(savedBlocks.some((block: any) => block.type === kind)).toBe(true);
       const downloads = imageRequests.length + videoRequests.length;
       const reset = await telegram(3, "/new"); await waitJob(reset.body.id);
       rejectImageDownload = true; rejectVideoDownload = true;
       const start = await telegram(4, "/start");
       expect((await waitJob(start.body.id)).status).toBe("complete");
-      expect((await probe("/test/context")).body).toEqual(saved);
+      const restored = (await probe("/test/context")).body;
+      if (kind === "video") {
+        expect(JSON.stringify(restored.entries)).toContain("[video omitted]");
+        expect(JSON.stringify(restored)).not.toContain("video-checkpoint");
+      } else expect(restored).toEqual(saved);
       const retry = await telegram(5, "/retry");
       expect((await waitJob(retry.body.id)).status).toBe("complete");
       expect(imageRequests.length + videoRequests.length).toBe(downloads);

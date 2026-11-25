@@ -6,7 +6,7 @@
   "compatibility_flags": ["nodejs_compat"],
   "workers_dev": true,
   "vars": {
-    "PI_MODEL": "moonshotai/kimi-k3.1-pro",
+    "PI_MODEL": "moonshotai/kimi-k3.1-pro:floor",
     "MEMORY_PREFIX": "hermes/",
     "WEB_SEARCH_PROVIDER": "exa"
   },
